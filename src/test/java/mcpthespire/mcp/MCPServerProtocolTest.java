@@ -1,6 +1,7 @@
 package mcpthespire.mcp;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonParser;
 
 import java.io.BufferedReader;
@@ -53,8 +54,33 @@ public class MCPServerProtocolTest {
             Response tools = request(port, "POST", TOOLS_LIST, null);
             JsonObject toolsResult = new JsonParser().parse(tools.body).getAsJsonObject()
                 .getAsJsonObject("result");
-            require(tools.status == 200 && toolsResult.getAsJsonArray("tools").size() == 19,
+            JsonArray toolDefinitions = toolsResult.getAsJsonArray("tools");
+            require(tools.status == 200 && toolDefinitions.size() == 20,
                 "tool discovery should remain available after GET requests");
+            JsonObject batchTool = null;
+            boolean hasMapTool = false;
+            for (int i = 0; i < toolDefinitions.size(); i++) {
+                JsonObject tool = toolDefinitions.get(i).getAsJsonObject();
+                if ("execute_actions".equals(tool.get("name").getAsString())) batchTool = tool;
+                if ("get_map".equals(tool.get("name").getAsString())) hasMapTool = true;
+            }
+            require(hasMapTool, "full map tool should be discoverable");
+            require(batchTool != null && "object".equals(batchTool.getAsJsonObject("inputSchema")
+                .getAsJsonObject("properties").getAsJsonObject("actions")
+                .getAsJsonObject("items").get("type").getAsString()),
+                "batch actions should be declared as objects");
+
+            JsonArray encodedActions = new JsonParser().parse(
+                "[\"{\\\"action\\\":\\\"play_card\\\",\\\"card_index\\\":1}\",{\"action\":\"end_turn\"}]").getAsJsonArray();
+            JsonArray normalizedActions = MCPServer.normalizeBatchActions(encodedActions);
+            require(normalizedActions.get(0).isJsonObject() && normalizedActions.get(1).isJsonObject(),
+                "legacy JSON-string actions should be normalized to objects");
+            try {
+                MCPServer.normalizeBatchActions(new JsonParser().parse("[42]").getAsJsonArray());
+                throw new AssertionError("non-object actions should be rejected");
+            } catch (IllegalArgumentException expected) {
+                require(expected.getMessage().contains("Action 1"), "validation should identify the bad action");
+            }
 
             require(requestWithOrigin(port, "http://example.com") == 403,
                 "cross-origin requests should be rejected");
@@ -128,8 +154,12 @@ public class MCPServerProtocolTest {
             output.write(headers.getBytes(StandardCharsets.US_ASCII));
             output.write(body);
             output.flush();
-            String status = new BufferedReader(new InputStreamReader(
-                socket.getInputStream(), StandardCharsets.US_ASCII)).readLine();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(
+                socket.getInputStream(), StandardCharsets.US_ASCII));
+            String status = reader.readLine();
+            while (reader.readLine() != null) {
+                // Consume the response before closing the socket.
+            }
             return Integer.parseInt(status.split(" ")[1]);
         }
     }

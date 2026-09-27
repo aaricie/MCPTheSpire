@@ -766,12 +766,10 @@ public class ChoiceScreenUtils {
         } else {
             for (ArrayList<MapRoomNode> rows : map) {
                 for (MapRoomNode node : rows) {
-                    if (node.hasEdges()) {
-                        boolean normalConnection = currMapNode.isConnectedTo(node);
-                        boolean wingedConnection = currMapNode.wingedIsConnectedTo(node);
-                        if (normalConnection || wingedConnection) {
-                            choices.add(node);
-                        }
+                    boolean normalConnection = currMapNode.isConnectedTo(node);
+                    boolean wingedConnection = currMapNode.wingedIsConnectedTo(node);
+                    if (normalConnection || wingedConnection) {
+                        choices.add(node);
                     }
                 }
             }

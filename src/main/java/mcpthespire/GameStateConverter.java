@@ -37,6 +37,7 @@ import mcpthespire.patches.UpdateBodyTextPatch;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Set;
 
 public class GameStateConverter {
@@ -102,22 +103,20 @@ public class GameStateConverter {
             if(AbstractDungeon.getCurrRoom().phase.equals(AbstractRoom.RoomPhase.COMBAT)) {
                 ArrayList<Object> hand = new ArrayList<>();
                 for(AbstractCard card : AbstractDungeon.player.hand.group) {
-                    hand.add(convertCardToJson(card));
+                    HashMap<String, Object> cardState = convertCardToJson(card);
+                    cardState.put("description", card.rawDescription);
+                    hand.add(cardState);
                 }
                 response.put("hand", hand);
                 response.put("current_energy", EnergyPanel.totalCount);
                 response.put("max_energy", AbstractDungeon.player.energy.energy);
+                response.put("player", convertPlayerToJson(AbstractDungeon.player));
+                response.put("potions", convertPotionsToJson(AbstractDungeon.player.potions));
 
                 ArrayList<Object> monsters = new ArrayList<>();
                 for(AbstractMonster monster : AbstractDungeon.getCurrRoom().monsters.monsters) {
                     if (!monster.isDeadOrEscaped()) {
-                        HashMap<String, Object> m = new HashMap<>();
-                        m.put("name", monster.name);
-                        m.put("current_hp", monster.currentHealth);
-                        m.put("max_hp", monster.maxHealth);
-                        m.put("intent", monster.intent.name());
-                        m.put("is_gone", monster.isDeadOrEscaped());
-                        monsters.add(m);
+                        monsters.add(convertMonsterToJson(monster));
                     }
                 }
                 response.put("monsters", monsters);
@@ -129,6 +128,24 @@ public class GameStateConverter {
         }
 
         return response;
+    }
+
+    public static HashMap<String, Object> getMapState() {
+        HashMap<String, Object> state = new HashMap<>();
+        boolean isInGame = CommandExecutor.isInDungeon();
+        state.put("in_game", isInGame);
+        if (!isInGame) {
+            state.put("screen_type", "MAIN_MENU");
+            return state;
+        }
+        state.put("act", AbstractDungeon.actNum);
+        state.put("floor", AbstractDungeon.floorNum);
+        if (!AbstractDungeon.bossList.isEmpty()) {
+            state.put("act_boss", AbstractDungeon.bossList.get(0));
+        }
+        state.put("map", convertMapToJson());
+        state.putAll(getMapScreenState());
+        return state;
     }
 
     /**
@@ -395,11 +412,20 @@ public class GameStateConverter {
         }
         ArrayList<Object> nextNodesJson = new ArrayList<>();
         for(MapRoomNode node : ChoiceScreenUtils.getMapScreenNodeChoices()) {
-            nextNodesJson.add(convertMapRoomNodeToJson(node));
+            HashMap<String, Object> nextNode = convertMapRoomNodeToJson(node);
+            nextNode.put("choice_index", nextNodesJson.size() + 1);
+            if (AbstractDungeon.firstRoomChosen && AbstractDungeon.getCurrMapNode() != null &&
+                !AbstractDungeon.getCurrMapNode().isConnectedTo(node)) {
+                nextNode.put("requires_winged_boots", true);
+            }
+            nextNodesJson.add(nextNode);
         }
         state.put("next_nodes", nextNodesJson);
         state.put("first_node_chosen", AbstractDungeon.firstRoomChosen);
         state.put("boss_available", ChoiceScreenUtils.bossNodeAvailable());
+        if (ChoiceScreenUtils.bossNodeAvailable()) {
+            state.put("boss_choice_index", 1);
+        }
         return state;
     }
 
@@ -577,27 +603,44 @@ public class GameStateConverter {
     private static ArrayList<Object> convertMapToJson() {
         ArrayList<ArrayList<MapRoomNode>> map = AbstractDungeon.map;
         ArrayList<Object> jsonMap = new ArrayList<>();
+        Set<String> connectedNodes = new HashSet<>();
+        Set<String> seenEdges = new HashSet<>();
+        HashMap<String, ArrayList<Object>> children = new HashMap<>();
+        HashMap<String, ArrayList<Object>> parents = new HashMap<>();
         for(ArrayList<MapRoomNode> layer : map) {
             for(MapRoomNode node : layer) {
-                if(node.hasEdges()) {
-                    HashMap<String, Object> json_node = convertMapRoomNodeToJson(node);
-                    ArrayList<Object> json_children = new ArrayList<>();
-                    ArrayList<Object> json_parents = new ArrayList<>();
+                if (node.hasEdges()) {
                     for(MapEdge edge : node.getEdges()) {
-                        if (edge.srcX == node.x && edge.srcY == node.y) {
-                            json_children.add(convertCoordinatesToJson(edge.dstX, edge.dstY));
-                        } else {
-                            json_parents.add(convertCoordinatesToJson(edge.srcX, edge.srcY));
+                        String source = coordinateKey(edge.srcX, edge.srcY);
+                        String destination = coordinateKey(edge.dstX, edge.dstY);
+                        if (seenEdges.add(source + ">" + destination)) {
+                            connectedNodes.add(source);
+                            connectedNodes.add(destination);
+                            if (!children.containsKey(source)) children.put(source, new ArrayList<>());
+                            if (!parents.containsKey(destination)) parents.put(destination, new ArrayList<>());
+                            children.get(source).add(convertCoordinatesToJson(edge.dstX, edge.dstY));
+                            parents.get(destination).add(convertCoordinatesToJson(edge.srcX, edge.srcY));
                         }
                     }
-
-                    json_node.put("parents", json_parents);
-                    json_node.put("children", json_children);
-                    jsonMap.add(json_node);
+                }
+            }
+        }
+        for (ArrayList<MapRoomNode> layer : map) {
+            for (MapRoomNode node : layer) {
+                String key = coordinateKey(node.x, node.y);
+                if (connectedNodes.contains(key)) {
+                    HashMap<String, Object> jsonNode = convertMapRoomNodeToJson(node);
+                    jsonNode.put("parents", parents.containsKey(key) ? parents.get(key) : new ArrayList<>());
+                    jsonNode.put("children", children.containsKey(key) ? children.get(key) : new ArrayList<>());
+                    jsonMap.add(jsonNode);
                 }
             }
         }
         return jsonMap;
+    }
+
+    private static String coordinateKey(int x, int y) {
+        return x + ":" + y;
     }
 
     private static HashMap<String, Object> convertCoordinatesToJson(int x, int y) {
@@ -610,6 +653,12 @@ public class GameStateConverter {
     private static HashMap<String, Object> convertMapRoomNodeToJson(MapRoomNode node) {
         HashMap<String, Object> jsonNode = convertCoordinatesToJson(node.x, node.y);
         jsonNode.put("symbol", node.getRoomSymbol(true));
+        if (node.room != null) {
+            jsonNode.put("room_type", node.room.getClass().getSimpleName());
+        }
+        if (node.hasEmeraldKey) {
+            jsonNode.put("has_emerald_key", true);
+        }
         return jsonNode;
     }
 
@@ -786,6 +835,10 @@ public class GameStateConverter {
         for (AbstractPower power : creature.powers) {
             HashMap<String, Object> json_power = new HashMap<>();
             json_power.put("id", power.ID);
+            json_power.put("name", power.name);
+            if (power.description != null) {
+                json_power.put("description", ChoiceScreenUtils.removeTextFormatting(power.description));
+            }
 
             // Amount - only include if non-zero (many powers use amount)
             if (power.amount != 0) {
@@ -831,6 +884,9 @@ public class GameStateConverter {
         HashMap<String, Object> jsonRelic = new HashMap<>();
         jsonRelic.put("id", relic.relicId);
         jsonRelic.put("name", relic.name);
+        if (relic.description != null) {
+            jsonRelic.put("description", ChoiceScreenUtils.removeTextFormatting(relic.description));
+        }
         // Counter: -1 means unused, -2 means special, only include if active
         if (relic.counter >= 0) {
             jsonRelic.put("counter", relic.counter);
@@ -847,6 +903,10 @@ public class GameStateConverter {
         if (potion instanceof PotionSlot) {
             jsonPotion.put("is_empty", true);
             return jsonPotion;
+        }
+
+        if (potion.description != null) {
+            jsonPotion.put("description", ChoiceScreenUtils.removeTextFormatting(potion.description));
         }
 
         // Only include if usable/discardable

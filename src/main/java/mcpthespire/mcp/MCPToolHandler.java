@@ -30,6 +30,7 @@ public class MCPToolHandler {
     // Read-only tools (do not mutate game state)
     private static final Set<String> READ_ONLY_TOOLS = new HashSet<>(Arrays.asList(
         "get_game_state",
+        "get_map",
         "get_screen_state",
         "get_available_commands",
         "get_card_info",
@@ -78,6 +79,12 @@ public class MCPToolHandler {
             MCPProtocol.createInputSchema(getGameStateProps, null)
         ));
 
+        tools.add(MCPProtocol.createToolDefinition(
+            "get_map",
+            "Get the full visible act map with room coordinates, directed paths, current position, and 1-indexed next route choices. Use before choosing a path.",
+            MCPProtocol.createInputSchema(new HashMap<>(), null)
+        ));
+
         // get_screen_state - Recommended for most queries
         tools.add(MCPProtocol.createToolDefinition(
             "get_screen_state",
@@ -122,6 +129,23 @@ public class MCPToolHandler {
         Map<String, Object> executeActionsProps = new HashMap<>();
         Map<String, Object> actionsArrayProp = new HashMap<>();
         actionsArrayProp.put("type", "array");
+        Map<String, Object> actionProps = new HashMap<>();
+        actionProps.put("action", MCPProtocol.createEnumProperty("Action to perform", Arrays.asList(
+            "play_card", "end_turn", "choose", "proceed", "skip", "cancel", "confirm",
+            "select_cards", "use_potion", "discard_potion", "wait")));
+        actionProps.put("card_index", MCPProtocol.createProperty("integer", "1-indexed card position in the initial hand"));
+        actionProps.put("card_name", MCPProtocol.createProperty("string", "Card name"));
+        actionProps.put("card_id", MCPProtocol.createProperty("string", "Card ID"));
+        actionProps.put("target_index", MCPProtocol.createProperty("integer", "1-indexed monster target"));
+        actionProps.put("choice_index", MCPProtocol.createProperty("integer", "1-indexed choice position"));
+        actionProps.put("potion_slot", MCPProtocol.createProperty("integer", "1-indexed potion slot"));
+        actionProps.put("ms", MCPProtocol.createProperty("integer", "Wait duration, maximum 500 ms"));
+        Map<String, Object> cardsProp = new HashMap<>();
+        cardsProp.put("type", "array");
+        cardsProp.put("description", "Cards by initial hand index, name, or ID");
+        actionProps.put("drop", cardsProp);
+        actionProps.put("keep", cardsProp);
+        actionsArrayProp.put("items", MCPProtocol.createInputSchema(actionProps, Arrays.asList("action")));
         actionsArrayProp.put("description",
             "Array of action objects. Each object has 'action' field plus action-specific params. " +
             "Available actions: " +
@@ -272,6 +296,9 @@ public class MCPToolHandler {
                 case "get_game_state":
                     return executeGetGameState(arguments);
 
+                case "get_map":
+                    return MCPProtocol.buildToolCallResultJson(GameStateConverter.getMapState());
+
                 case "get_screen_state":
                     return executeGetScreenState();
 
@@ -396,6 +423,13 @@ public class MCPToolHandler {
                 Map<String, Object> tool = new HashMap<>();
                 tool.put("tool", "choose");
                 tool.put("description", "Make a choice from: " + ChoiceScreenUtils.getCurrentChoiceList());
+                availableTools.add(tool);
+            }
+
+            if (screenType == ChoiceScreenUtils.ChoiceType.MAP) {
+                Map<String, Object> tool = new HashMap<>();
+                tool.put("tool", "get_map");
+                tool.put("description", "Inspect the full act map before choosing a route");
                 availableTools.add(tool);
             }
 

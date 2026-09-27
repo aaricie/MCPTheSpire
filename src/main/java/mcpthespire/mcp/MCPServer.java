@@ -2,6 +2,7 @@ package mcpthespire.mcp;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
@@ -382,12 +383,18 @@ public class MCPServer implements Runnable {
      * Start a new batch execution.
      */
     private void startBatchExecution(JsonObject params) {
-        if (!params.has("actions") || !params.get("actions").isJsonArray()) {
+        if (params == null || !params.has("actions") || !params.get("actions").isJsonArray()) {
             toolCallResults.add(MCPProtocol.buildToolCallResult("Error: 'actions' array is required", true));
             return;
         }
 
-        com.google.gson.JsonArray actions = params.getAsJsonArray("actions");
+        com.google.gson.JsonArray actions;
+        try {
+            actions = normalizeBatchActions(params.getAsJsonArray("actions"));
+        } catch (IllegalArgumentException e) {
+            toolCallResults.add(MCPProtocol.buildToolCallResult("Error: " + e.getMessage(), true));
+            return;
+        }
         if (actions.size() == 0) {
             toolCallResults.add(MCPProtocol.buildToolCallResult("Error: 'actions' array is empty", true));
             return;
@@ -398,6 +405,30 @@ public class MCPServer implements Runnable {
 
         // Execute first action immediately
         processBatchAction();
+    }
+
+    static com.google.gson.JsonArray normalizeBatchActions(com.google.gson.JsonArray actions) {
+        com.google.gson.JsonArray normalized = new com.google.gson.JsonArray();
+        for (int i = 0; i < actions.size(); i++) {
+            JsonElement value = actions.get(i);
+            if (value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()) {
+                try {
+                    value = new JsonParser().parse(value.getAsString());
+                } catch (RuntimeException e) {
+                    throw new IllegalArgumentException("Action " + (i + 1) + " is not a JSON object");
+                }
+            }
+            if (!value.isJsonObject()) {
+                throw new IllegalArgumentException("Action " + (i + 1) + " must be an object");
+            }
+            JsonObject action = value.getAsJsonObject();
+            if (!action.has("action") || !action.get("action").isJsonPrimitive() ||
+                !action.get("action").getAsJsonPrimitive().isString()) {
+                throw new IllegalArgumentException("Action " + (i + 1) + " needs a string 'action' field");
+            }
+            normalized.add(action);
+        }
+        return normalized;
     }
 
     /**
@@ -426,17 +457,11 @@ public class MCPServer implements Runnable {
             return;
         }
 
-        JsonObject action = pendingBatch.getCurrentAction();
-        if (!action.has("action")) {
-            pendingBatch.markError(null, "Missing 'action' field");
-            finishBatchExecution();
-            return;
-        }
-
-        String actionType = action.get("action").getAsString();
-        logger.info("Batch executing action " + (pendingBatch.currentIndex + 1) + "/" + pendingBatch.actions.size() + ": " + actionType);
-
+        String actionType = null;
         try {
+            JsonObject action = pendingBatch.getCurrentAction();
+            actionType = action.get("action").getAsString();
+            logger.info("Batch executing action " + (pendingBatch.currentIndex + 1) + "/" + pendingBatch.actions.size() + ": " + actionType);
             if ("wait".equals(actionType)) {
                 // Wait action doesn't need frame delay, just a sleep
                 int waitMs = action.has("ms") ? action.get("ms").getAsInt() : 100;

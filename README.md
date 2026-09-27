@@ -90,6 +90,9 @@ Get complete game state with optional filtering.
 {"include": ["player", "combat", "map"]}
 ```
 
+#### `get_map`
+Get the full visible route graph for the current act, including room coordinates/types, connections, the current node, and `choice_index` values for the next reachable nodes. This is the simplest way to plan a path; call it again after moving to a new act.
+
 #### `get_screen_state`
 Get lightweight current screen state. **Recommended for most use cases.**
 
@@ -99,6 +102,7 @@ Get lightweight current screen state. **Recommended for most use cases.**
 - `choice_list`: Available choices
 - `can_proceed` / `can_cancel`: Button availability
 - `hand`, `monsters`, `energy`: Combat info (if in combat)
+- Player powers/block, potion descriptions, card descriptions, and monster attack details (if in combat)
 
 #### `get_available_commands`
 Get context-aware list of available tools for current screen.
@@ -156,6 +160,8 @@ Get detailed card information including description and upgraded version.
 
 #### `execute_actions`
 Execute multiple actions in sequence. **This is the most efficient way to play.**
+
+Pass action objects, not JSON strings: `{"actions":[{"action":"play_card","card_index":1,"target_index":1},{"action":"end_turn"}]}`.
 
 Actions wait for the game to be ready (animations complete, state updated) before each execution. This ensures reliable execution without manual timing.
 
