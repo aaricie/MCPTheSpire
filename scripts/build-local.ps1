@@ -16,28 +16,47 @@ foreach ($dependency in @($gameJar, $modTheSpireJar, $baseModJar)) {
     }
 }
 
-if (-not (Get-Command $Javac -ErrorAction SilentlyContinue)) {
+$javacCommand = Get-Command $Javac -ErrorAction SilentlyContinue
+if (-not $javacCommand) {
     throw "Java compiler not found: $Javac. Pass -Javac with the path to a JDK javac.exe."
+}
+$java = Join-Path (Split-Path $javacCommand.Source -Parent) 'java.exe'
+if (-not (Test-Path -LiteralPath $java -PathType Leaf)) {
+    throw "Java runtime not found next to compiler: $java"
 }
 
 $targetDirectory = Join-Path $projectRoot 'target'
 $classesDirectory = Join-Path $targetDirectory 'local-classes'
+$testClassesDirectory = Join-Path $targetDirectory 'local-test-classes'
 $jarPath = Join-Path $targetDirectory 'MCPTheSpire.jar'
 $projectPrefix = $projectRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-if (-not [IO.Path]::GetFullPath($classesDirectory).StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'Build output is outside the project directory.'
+foreach ($buildDirectory in @($classesDirectory, $testClassesDirectory)) {
+    if (-not [IO.Path]::GetFullPath($buildDirectory).StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Build output is outside the project directory.'
+    }
+    if (Test-Path -LiteralPath $buildDirectory) {
+        Remove-Item -LiteralPath $buildDirectory -Recurse -Force
+    }
+    $null = New-Item -ItemType Directory -Force -Path $buildDirectory
 }
-if (Test-Path -LiteralPath $classesDirectory) {
-    Remove-Item -LiteralPath $classesDirectory -Recurse -Force
-}
-$null = New-Item -ItemType Directory -Force -Path $classesDirectory
 
 $sourceDirectory = Join-Path $projectRoot 'src\main\java'
 $sourceFiles = @(Get-ChildItem -LiteralPath $sourceDirectory -Recurse -Filter '*.java' -File | ForEach-Object FullName)
 $classPath = "$gameJar;$modTheSpireJar;$baseModJar"
-& $Javac --release 8 -proc:none -cp $classPath -d $classesDirectory $sourceFiles
+# ModTheSpire reads patch parameter names from the LocalVariableTable.
+& $javacCommand.Source --release 8 -g -proc:none -Xlint:-options -cp $classPath -d $classesDirectory $sourceFiles
 if ($LASTEXITCODE -ne 0) {
     throw "Java compilation failed with exit code $LASTEXITCODE."
+}
+
+$metadataTest = Join-Path $projectRoot 'src\test\java\mcpthespire\patches\PatchParameterMetadataTest.java'
+& $javacCommand.Source --release 8 -proc:none -Xlint:-options -cp "$classesDirectory;$classPath" -d $testClassesDirectory $metadataTest
+if ($LASTEXITCODE -ne 0) {
+    throw "Patch metadata test compilation failed with exit code $LASTEXITCODE."
+}
+& $java -cp "$testClassesDirectory;$classesDirectory;$classPath" mcpthespire.patches.PatchParameterMetadataTest $classesDirectory
+if ($LASTEXITCODE -ne 0) {
+    throw "Patch metadata test failed with exit code $LASTEXITCODE."
 }
 
 $resourcesDirectory = Join-Path $projectRoot 'src\main\resources'
