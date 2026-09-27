@@ -18,7 +18,7 @@ import java.util.List;
 public class MCPProtocol {
 
     public static final String JSONRPC_VERSION = "2.0";
-    public static final String MCP_VERSION = "2024-11-05";
+    public static final String MCP_VERSION = "2025-03-26";
 
     // MCP Methods
     public static final String METHOD_INITIALIZE = "initialize";

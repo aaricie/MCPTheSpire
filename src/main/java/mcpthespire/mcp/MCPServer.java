@@ -1,6 +1,5 @@
 package mcpthespire.mcp;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonSyntaxException;
@@ -12,11 +11,12 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.*;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -34,11 +34,10 @@ public class MCPServer implements Runnable {
     private final String host;
     private final int port;
     private final MCPToolHandler toolHandler;
-    private final Gson gson;
     private HttpServer httpServer;
+    private ExecutorService httpExecutor;
 
     private volatile boolean running = true;
-    private String sessionId = null;
 
     // Queue for pending tool calls that need to be executed on the game thread
     private final BlockingQueue<PendingToolCall> pendingToolCalls;
@@ -68,7 +67,6 @@ public class MCPServer implements Runnable {
         this.host = host;
         this.port = port;
         this.toolHandler = new MCPToolHandler();
-        this.gson = new Gson();
         this.pendingToolCalls = new LinkedBlockingQueue<>();
         this.toolCallResults = new LinkedBlockingQueue<>();
     }
@@ -77,7 +75,8 @@ public class MCPServer implements Runnable {
     public void run() {
         try {
             httpServer = HttpServer.create(new InetSocketAddress(host, port), 0);
-            httpServer.setExecutor(Executors.newFixedThreadPool(4));
+            httpExecutor = Executors.newFixedThreadPool(4);
+            httpServer.setExecutor(httpExecutor);
 
             // Main MCP endpoint - Streamable HTTP
             httpServer.createContext("/mcp", new MCPHandler());
@@ -101,6 +100,8 @@ public class MCPServer implements Runnable {
                 Thread.sleep(1000);
             }
 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } catch (Exception e) {
             logger.error("Error starting MCP HTTP server", e);
         }
@@ -113,6 +114,26 @@ public class MCPServer implements Runnable {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             String method = exchange.getRequestMethod();
+            String origin = exchange.getRequestHeaders().getFirst("Origin");
+
+            if (origin != null) {
+                try {
+                    URI uri = URI.create(origin);
+                    if (!"http".equalsIgnoreCase(uri.getScheme()) ||
+                        !host.equalsIgnoreCase(uri.getHost()) || uri.getPort() != port ||
+                        uri.getRawUserInfo() != null || uri.getRawQuery() != null ||
+                        uri.getRawFragment() != null ||
+                        (uri.getRawPath() != null && !uri.getRawPath().isEmpty())) {
+                        exchange.sendResponseHeaders(403, -1);
+                        return;
+                    }
+                } catch (IllegalArgumentException e) {
+                    exchange.sendResponseHeaders(403, -1);
+                    return;
+                }
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
+                exchange.getResponseHeaders().set("Vary", "Origin");
+            }
 
             // Handle CORS preflight
             if ("OPTIONS".equalsIgnoreCase(method)) {
@@ -120,37 +141,23 @@ public class MCPServer implements Runnable {
                 return;
             }
 
-            // Set CORS headers for all responses
-            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-            exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-            exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-            exchange.getResponseHeaders().set("Access-Control-Expose-Headers", "Mcp-Session-Id");
-
             if ("POST".equalsIgnoreCase(method)) {
                 handlePost(exchange);
-            } else if ("GET".equalsIgnoreCase(method)) {
-                // GET for SSE stream (optional, for server-initiated notifications)
-                handleGet(exchange);
-            } else if ("DELETE".equalsIgnoreCase(method)) {
-                // DELETE to close session
-                handleDelete(exchange);
             } else {
+                // This server sends no unsolicited messages, so it offers no GET SSE stream.
+                exchange.getResponseHeaders().set("Allow", "POST, OPTIONS");
                 exchange.sendResponseHeaders(405, -1);
             }
         }
 
         private void handleCORS(HttpExchange exchange) throws IOException {
-            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-            exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-            exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
-            exchange.getResponseHeaders().set("Access-Control-Expose-Headers", "Mcp-Session-Id");
+            exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, OPTIONS");
+            exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version");
             exchange.getResponseHeaders().set("Access-Control-Max-Age", "86400");
             exchange.sendResponseHeaders(204, -1);
         }
 
         private void handlePost(HttpExchange exchange) throws IOException {
-            exchange.getResponseHeaders().set("Content-Type", "application/json");
-
             // Read request body
             String requestBody;
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8))) {
@@ -165,13 +172,13 @@ public class MCPServer implements Runnable {
             logger.info("Received MCP request: " + requestBody);
 
             try {
-                String response = handleMessage(requestBody, exchange);
-
-                // Add session ID header if we have one
-                if (sessionId != null) {
-                    exchange.getResponseHeaders().set("Mcp-Session-Id", sessionId);
+                String response = handleMessage(requestBody);
+                if (response == null) {
+                    exchange.sendResponseHeaders(202, -1);
+                    return;
                 }
 
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
                 byte[] responseBytes = response.getBytes(StandardCharsets.UTF_8);
                 exchange.sendResponseHeaders(200, responseBytes.length);
                 try (OutputStream os = exchange.getResponseBody()) {
@@ -182,6 +189,7 @@ public class MCPServer implements Runnable {
                 logger.error("Error handling MCP request", e);
                 String errorResponse = MCPProtocol.buildErrorResponse(null, MCPProtocol.ERROR_INTERNAL, e.getMessage());
                 byte[] responseBytes = errorResponse.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
                 exchange.sendResponseHeaders(500, responseBytes.length);
                 try (OutputStream os = exchange.getResponseBody()) {
                     os.write(responseBytes);
@@ -189,65 +197,9 @@ public class MCPServer implements Runnable {
             }
         }
 
-        private void handleGet(HttpExchange exchange) throws IOException {
-            // GET request for SSE stream - used for server-to-client notifications
-            String accept = exchange.getRequestHeaders().getFirst("Accept");
-
-            if (accept != null && accept.contains("text/event-stream")) {
-                // Return SSE stream for notifications
-                exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
-                exchange.getResponseHeaders().set("Cache-Control", "no-cache");
-                exchange.getResponseHeaders().set("Connection", "keep-alive");
-
-                if (sessionId != null) {
-                    exchange.getResponseHeaders().set("Mcp-Session-Id", sessionId);
-                }
-
-                exchange.sendResponseHeaders(200, 0);
-
-                try (OutputStream os = exchange.getResponseBody();
-                     PrintWriter writer = new PrintWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8), true)) {
-
-                    // Send initial comment to establish connection
-                    writer.print(": connected\n\n");
-                    writer.flush();
-                    os.flush();
-
-                    // Keep connection alive
-                    while (running) {
-                        Thread.sleep(30000);
-                        writer.print(": keepalive\n\n");
-                        writer.flush();
-                        os.flush();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            } else {
-                // Regular GET - return server info
-                Map<String, String> serverInfo = new HashMap<>();
-                serverInfo.put("name", SERVER_NAME);
-                serverInfo.put("version", SERVER_VERSION);
-                serverInfo.put("transport", "streamable-http");
-                String info = gson.toJson(serverInfo);
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                byte[] responseBytes = info.getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(200, responseBytes.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(responseBytes);
-                }
-            }
-        }
-
-        private void handleDelete(HttpExchange exchange) throws IOException {
-            // Close session
-            sessionId = null;
-            exchange.sendResponseHeaders(204, -1);
-            logger.info("MCP session closed");
-        }
     }
 
-    private String handleMessage(String message, HttpExchange exchange) {
+    private String handleMessage(String message) {
         JsonObject request;
         try {
             request = MCPProtocol.parseRequest(message);
@@ -261,13 +213,12 @@ public class MCPServer implements Runnable {
 
         logger.info("MCP method: " + method + ", id: " + id);
 
-        // Handle notifications (no id) - just return empty
+        // JSON-RPC notifications have no response body.
         if (id == null) {
             if (MCPProtocol.METHOD_INITIALIZED.equals(method)) {
                 logger.info("Client initialized notification received");
             }
-            // Notifications don't require a response, but we'll send an empty success
-            return "{}";
+            return null;
         }
 
         if (method == null) {
@@ -279,8 +230,8 @@ public class MCPServer implements Runnable {
                 return handleInitialize(id, params);
 
             case MCPProtocol.METHOD_INITIALIZED:
-                logger.info("Client initialized notification received");
-                return MCPProtocol.buildResponse(id, new HashMap<>());
+                return MCPProtocol.buildErrorResponse(id, MCPProtocol.ERROR_INVALID_REQUEST,
+                    "notifications/initialized must not have an id");
 
             case MCPProtocol.METHOD_TOOLS_LIST:
                 return handleToolsList(id);
@@ -297,11 +248,8 @@ public class MCPServer implements Runnable {
     }
 
     private String handleInitialize(JsonElement id, JsonObject params) {
-        // Generate session ID
-        sessionId = UUID.randomUUID().toString();
-
         Map<String, Object> result = MCPProtocol.buildInitializeResult(SERVER_NAME, SERVER_VERSION);
-        logger.info("MCP initialized, session: " + sessionId);
+        logger.info("MCP initialized");
         return MCPProtocol.buildResponse(id, result);
     }
 
@@ -665,6 +613,9 @@ public class MCPServer implements Runnable {
         running = false;
         if (httpServer != null) {
             httpServer.stop(0);
+        }
+        if (httpExecutor != null) {
+            httpExecutor.shutdownNow();
         }
     }
 

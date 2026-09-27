@@ -30,6 +30,10 @@ A Slay the Spire mod that enables AI agents to play the game through the Model C
 5. Launch Slay the Spire through ModTheSpire
 6. Enable the "MCP The Spire" mod in the ModTheSpire menu
 
+### Build locally on Windows
+
+From this checkout, run `scripts\build-local.ps1 -Javac 'C:\path\to\jdk\bin\javac.exe'` in PowerShell. The script uses the default Steam installation path, the installed ModTheSpire and BaseMod workshop JARs, and writes `target\MCPTheSpire.jar`. Pass `-GameDirectory` if Slay the Spire is installed elsewhere. Copy that JAR into the game's `mods` directory, select MCP The Spire in ModTheSpire, and launch the game.
+
 ## Configuration
 
 The mod can be configured through the config file at `MCPTheSpire/config.properties`:
@@ -47,6 +51,16 @@ Configure your MCP client to connect to:
 ```
 http://127.0.0.1:8080/mcp
 ```
+
+For Codex, add this to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.slay_the_spire]
+enabled = true
+url = "http://127.0.0.1:8080/mcp"
+```
+
+The MCP server starts inside the modded game. Launch Slay the Spire with ModTheSpire first; after it reaches the main menu, an MCP client can start or continue a run and control gameplay through the exposed tools. The mod does not launch the game executable or enable mods itself.
 
 For Claude Desktop, add to your MCP config:
 ```json
