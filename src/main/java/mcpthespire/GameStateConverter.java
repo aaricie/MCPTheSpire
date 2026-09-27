@@ -7,6 +7,7 @@ import com.megacrit.cardcrawl.helpers.CardLibrary;
 import com.megacrit.cardcrawl.helpers.RelicLibrary;
 import com.megacrit.cardcrawl.characters.AbstractPlayer;
 import com.megacrit.cardcrawl.core.AbstractCreature;
+import com.megacrit.cardcrawl.core.CardCrawlGame;
 import com.megacrit.cardcrawl.core.Settings;
 import com.megacrit.cardcrawl.dungeons.AbstractDungeon;
 import com.megacrit.cardcrawl.events.AbstractEvent;
@@ -21,6 +22,7 @@ import com.megacrit.cardcrawl.potions.PotionSlot;
 import com.megacrit.cardcrawl.powers.AbstractPower;
 import com.megacrit.cardcrawl.relics.AbstractRelic;
 import com.megacrit.cardcrawl.relics.RunicDome;
+import com.megacrit.cardcrawl.relics.VelvetChoker;
 import com.megacrit.cardcrawl.rewards.RewardItem;
 import com.megacrit.cardcrawl.rooms.*;
 import com.megacrit.cardcrawl.screens.DeathScreen;
@@ -36,6 +38,7 @@ import mcpthespire.patches.UpdateBodyTextPatch;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
@@ -48,7 +51,8 @@ public class GameStateConverter {
 
     public static HashMap<String, Object> getCommunicationState(Set<String> include) {
         HashMap<String, Object> response = new HashMap<>();
-        response.put("ready_for_command", GameStateListener.isWaitingForCommand());
+        response.put("ready_for_command", GameStateListener.isCommandReadyNow());
+        response.put("readiness", GameStateListener.getReadinessReason());
         boolean isInGame = CommandExecutor.isInDungeon();
         response.put("in_game", isInGame);
         if(isInGame) {
@@ -63,14 +67,18 @@ public class GameStateConverter {
      */
     public static HashMap<String, Object> getScreenOnlyState() {
         HashMap<String, Object> response = new HashMap<>();
-        response.put("ready_for_command", GameStateListener.isWaitingForCommand());
+        response.put("ready_for_command", GameStateListener.isCommandReadyNow());
+        response.put("readiness", GameStateListener.getReadinessReason());
         boolean isInGame = CommandExecutor.isInDungeon();
         response.put("in_game", isInGame);
 
         if(isInGame) {
             ChoiceScreenUtils.ChoiceType screenType = ChoiceScreenUtils.getCurrentChoiceType();
             response.put("screen_type", screenType.name());
-            response.put("screen_name", AbstractDungeon.screen.name());
+            response.put("screen_name", getReportedScreenName(screenType));
+            if (screenType == ChoiceScreenUtils.ChoiceType.GAME_OVER) {
+                response.put("raw_screen_name", AbstractDungeon.screen.name());
+            }
             response.put("is_screen_up", AbstractDungeon.isScreenUp);
             response.put("room_phase", AbstractDungeon.getCurrRoom().phase.toString());
             response.put("room_type", AbstractDungeon.getCurrRoom().getClass().getSimpleName());
@@ -112,6 +120,9 @@ public class GameStateConverter {
                 response.put("max_energy", AbstractDungeon.player.energy.energy);
                 response.put("player", convertPlayerToJson(AbstractDungeon.player));
                 response.put("potions", convertPotionsToJson(AbstractDungeon.player.potions));
+                response.put("turn", GameActionManager.turn);
+                addCardPlayLimit(response);
+                response.put("pile_counts", getPileCounts());
 
                 ArrayList<Object> monsters = new ArrayList<>();
                 for(AbstractMonster monster : AbstractDungeon.getCurrRoom().monsters.monsters) {
@@ -124,10 +135,119 @@ public class GameStateConverter {
         } else {
             // Main menu state
             response.put("screen_type", "MAIN_MENU");
+            if (CardCrawlGame.mainMenuScreen != null && CardCrawlGame.mainMenuScreen.screen != null) {
+                response.put("menu_screen", CardCrawlGame.mainMenuScreen.screen.name());
+            }
             response.put("available_commands", CommandExecutor.getAvailableCommands());
         }
 
         return response;
+    }
+
+    public static HashMap<String, Object> getPilesState() {
+        HashMap<String, Object> state = new HashMap<>();
+        boolean inGame = CommandExecutor.isInDungeon();
+        state.put("in_game", inGame);
+        if (!inGame || AbstractDungeon.player == null ||
+            AbstractDungeon.getCurrRoom().phase != AbstractRoom.RoomPhase.COMBAT) {
+            state.put("available", false);
+            return state;
+        }
+        state.put("available", true);
+        state.put("counts", getPileCounts());
+        state.put("draw_pile", convertUnorderedPileToJson(AbstractDungeon.player.drawPile.group));
+        state.put("discard_pile", convertPileToJson(AbstractDungeon.player.discardPile.group));
+        state.put("exhaust_pile", convertPileToJson(AbstractDungeon.player.exhaustPile.group));
+        state.put("draw_order_known", false);
+        return state;
+    }
+
+    public static HashMap<String, Object> getActionSummary() {
+        HashMap<String, Object> state = new HashMap<>();
+        boolean inGame = CommandExecutor.isInDungeon();
+        state.put("in_game", inGame);
+        state.put("ready_for_command", GameStateListener.isCommandReadyNow());
+        state.put("readiness", GameStateListener.getReadinessReason());
+        if (!inGame) {
+            state.put("screen_type", "MAIN_MENU");
+            if (CardCrawlGame.mainMenuScreen != null && CardCrawlGame.mainMenuScreen.screen != null) {
+                state.put("menu_screen", CardCrawlGame.mainMenuScreen.screen.name());
+            }
+            if (CardCrawlGame.characterManager != null) {
+                state.put("save_file_exists", CardCrawlGame.characterManager.anySaveFileExists());
+            }
+            return state;
+        }
+        ChoiceScreenUtils.ChoiceType screen = ChoiceScreenUtils.getCurrentChoiceType();
+        state.put("screen_type", screen.name());
+        state.put("floor", AbstractDungeon.floorNum);
+        state.put("current_hp", AbstractDungeon.player.currentHealth);
+        state.put("room_phase", AbstractDungeon.getCurrRoom().phase.name());
+        if (screen == ChoiceScreenUtils.ChoiceType.GAME_OVER) {
+            state.putAll(getGameOverState());
+            return state;
+        }
+        if (AbstractDungeon.getCurrRoom().phase == AbstractRoom.RoomPhase.COMBAT) {
+            state.put("turn", GameActionManager.turn);
+            state.put("energy", EnergyPanel.totalCount);
+            state.put("player", convertPlayerToJson(AbstractDungeon.player));
+            state.put("pile_counts", getPileCounts());
+            addCardPlayLimit(state);
+            ArrayList<Object> hand = new ArrayList<>();
+            for (AbstractCard card : AbstractDungeon.player.hand.group) {
+                hand.add(convertCardToJson(card));
+            }
+            state.put("hand", hand);
+            ArrayList<Object> monsters = new ArrayList<>();
+            for (AbstractMonster monster : AbstractDungeon.getCurrRoom().monsters.monsters) {
+                if (!monster.isDeadOrEscaped()) monsters.add(convertMonsterToJson(monster));
+            }
+            state.put("monsters", monsters);
+        } else if (CommandExecutor.isChooseCommandAvailable()) {
+            state.put("choice_list", ChoiceScreenUtils.getCurrentChoiceList());
+        }
+        return state;
+    }
+
+    private static HashMap<String, Object> getPileCounts() {
+        HashMap<String, Object> counts = new HashMap<>();
+        counts.put("draw", AbstractDungeon.player.drawPile.size());
+        counts.put("discard", AbstractDungeon.player.discardPile.size());
+        counts.put("exhaust", AbstractDungeon.player.exhaustPile.size());
+        return counts;
+    }
+
+    private static ArrayList<Object> convertPileToJson(ArrayList<AbstractCard> cards) {
+        ArrayList<Object> result = new ArrayList<>();
+        for (AbstractCard card : cards) {
+            HashMap<String, Object> cardState = convertCardToJson(card);
+            cardState.remove("is_playable");
+            result.add(cardState);
+        }
+        return result;
+    }
+
+    private static ArrayList<Object> convertUnorderedPileToJson(ArrayList<AbstractCard> cards) {
+        ArrayList<AbstractCard> unordered = new ArrayList<>(cards);
+        unordered.sort(Comparator.comparing((AbstractCard card) -> card.cardID)
+            .thenComparing(card -> card.uuid.toString()));
+        return convertPileToJson(unordered);
+    }
+
+    private static String getReportedScreenName(ChoiceScreenUtils.ChoiceType screenType) {
+        if (screenType == ChoiceScreenUtils.ChoiceType.GAME_OVER) {
+            return getGameOverState().get("outcome").toString().toUpperCase();
+        }
+        return AbstractDungeon.screen.name();
+    }
+
+    private static void addCardPlayLimit(HashMap<String, Object> state) {
+        int played = AbstractDungeon.actionManager.cardsPlayedThisTurn.size();
+        state.put("cards_played_this_turn", played);
+        if (AbstractDungeon.player.hasRelic(VelvetChoker.ID)) {
+            state.put("card_play_limit", 6);
+            state.put("card_plays_remaining", Math.max(0, 6 - played));
+        }
     }
 
     public static HashMap<String, Object> getMapState() {
@@ -263,7 +383,10 @@ public class GameStateConverter {
 
         // Screen section: choices, screen_state, buttons
         if (all || include.contains("screen")) {
-            state.put("screen_name", AbstractDungeon.screen.name());
+            state.put("screen_name", getReportedScreenName(ChoiceScreenUtils.getCurrentChoiceType()));
+            if (ChoiceScreenUtils.getCurrentChoiceType() == ChoiceScreenUtils.ChoiceType.GAME_OVER) {
+                state.put("raw_screen_name", AbstractDungeon.screen.name());
+            }
             state.put("is_screen_up", AbstractDungeon.isScreenUp);
             state.put("room_type", AbstractDungeon.getCurrRoom().getClass().getSimpleName());
             if (CommandExecutor.isChooseCommandAvailable()) {
@@ -496,13 +619,20 @@ public class GameStateConverter {
 
     private static HashMap<String, Object> getHandSelectState() {
         HashMap<String, Object> state = new HashMap<>();
-        ArrayList<Object> handJson = new ArrayList<>();
+        ArrayList<Object> eligibleJson = new ArrayList<>();
+        ArrayList<Object> fullHandJson = new ArrayList<>();
         ArrayList<Object> selectedJson = new ArrayList<>();
         ArrayList<AbstractCard> handCards = AbstractDungeon.player.hand.group;
         for(AbstractCard card : handCards) {
-            handJson.add(convertCardToJson(card));
+            eligibleJson.add(convertCardToJson(card));
         }
-        state.put("hand", handJson);
+        for (AbstractCard card : HandSelectionTracker.getHandBeforeSelection()) {
+            fullHandJson.add(convertCardToJson(card));
+        }
+        state.put("eligible_choices", eligibleJson);
+        state.put("full_hand_before_selection", fullHandJson);
+        state.put("hand", eligibleJson);
+        state.put("hand_role", "eligible_choices");
         ArrayList<AbstractCard> selectedCards = AbstractDungeon.handCardSelectScreen.selectedCards.group;
         for(AbstractCard card : selectedCards) {
             selectedJson.add(convertCardToJson(card));
@@ -526,6 +656,7 @@ public class GameStateConverter {
         }
         state.put("score", score);
         state.put("victory", victory);
+        state.put("outcome", victory ? "victory" : "defeat");
         return state;
     }
 
@@ -566,18 +697,9 @@ public class GameStateConverter {
             }
         }
         state.put("monsters", monsters);
-        ArrayList<Object> draw_pile = new ArrayList<>();
-        for(AbstractCard card : AbstractDungeon.player.drawPile.group) {
-            draw_pile.add(convertCardToJson(card));
-        }
-        ArrayList<Object> discard_pile = new ArrayList<>();
-        for(AbstractCard card : AbstractDungeon.player.discardPile.group) {
-            discard_pile.add(convertCardToJson(card));
-        }
-        ArrayList<Object> exhaust_pile = new ArrayList<>();
-        for(AbstractCard card : AbstractDungeon.player.exhaustPile.group) {
-            exhaust_pile.add(convertCardToJson(card));
-        }
+        ArrayList<Object> draw_pile = convertUnorderedPileToJson(AbstractDungeon.player.drawPile.group);
+        ArrayList<Object> discard_pile = convertPileToJson(AbstractDungeon.player.discardPile.group);
+        ArrayList<Object> exhaust_pile = convertPileToJson(AbstractDungeon.player.exhaustPile.group);
         ArrayList<Object> hand = new ArrayList<>();
         for(AbstractCard card : AbstractDungeon.player.hand.group) {
             hand.add(convertCardToJson(card));
@@ -587,6 +709,7 @@ public class GameStateConverter {
             limbo.add(convertCardToJson(card));
         }
         state.put("draw_pile", draw_pile);
+        state.put("draw_order_known", false);
         state.put("discard_pile", discard_pile);
         state.put("exhaust_pile", exhaust_pile);
         state.put("hand", hand);

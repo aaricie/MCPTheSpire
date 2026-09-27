@@ -4,6 +4,7 @@ import com.megacrit.cardcrawl.actions.GameActionManager;
 import com.megacrit.cardcrawl.core.CardCrawlGame;
 import com.megacrit.cardcrawl.dungeons.AbstractDungeon;
 import com.megacrit.cardcrawl.neow.NeowRoom;
+import com.megacrit.cardcrawl.monsters.AbstractMonster;
 import com.megacrit.cardcrawl.rooms.AbstractRoom;
 import com.megacrit.cardcrawl.rooms.EventRoom;
 import com.megacrit.cardcrawl.rooms.VictoryRoom;
@@ -184,5 +185,50 @@ public class GameStateListener {
 
     public static boolean isWaitingForCommand() {
         return waitingForCommand;
+    }
+
+    public static boolean isCommandReadyNow() {
+        return "ready".equals(getReadinessReason());
+    }
+
+    public static String getReadinessReason() {
+        if (!CommandExecutor.isInDungeon()) {
+            if (CardCrawlGame.mode == CardCrawlGame.GameMode.CHAR_SELECT &&
+                CardCrawlGame.mainMenuScreen != null &&
+                !CardCrawlGame.mainMenuScreen.isFadingOut) {
+                return "ready";
+            }
+            return "transitioning";
+        }
+        if (AbstractDungeon.isFadingOut || AbstractDungeon.isFadingIn) {
+            return "transitioning";
+        }
+        AbstractRoom room = AbstractDungeon.getCurrRoom();
+        if (room == null) return "transitioning";
+        if (AbstractDungeon.isScreenUp) {
+            return waitingForCommand ? "ready" : "screen_settling";
+        }
+        if (room.phase == AbstractRoom.RoomPhase.COMBAT) {
+            if (!myTurn || AbstractDungeon.player.endTurnQueued) return "enemy_turn";
+            if (AbstractDungeon.actionManager.phase != GameActionManager.Phase.WAITING_ON_USER ||
+                !AbstractDungeon.actionManager.preTurnActions.isEmpty() ||
+                !AbstractDungeon.actionManager.actions.isEmpty() ||
+                !AbstractDungeon.actionManager.cardQueue.isEmpty()) {
+                return "resolving_actions";
+            }
+            if (AbstractDungeon.getMonsters() != null) {
+                for (AbstractMonster monster : AbstractDungeon.getMonsters().monsters) {
+                    if (!monster.isDeadOrEscaped() && monster.intent == AbstractMonster.Intent.DEBUG) {
+                        return "enemy_intent_initializing";
+                    }
+                }
+            }
+        }
+        if ((room instanceof EventRoom || room instanceof NeowRoom ||
+            (room instanceof VictoryRoom && ((VictoryRoom) room).eType == VictoryRoom.EventType.HEART)) &&
+            room.event != null && room.event.waitTimer != 0.0F) {
+            return "event_animation";
+        }
+        return waitingForCommand ? "ready" : "settling";
     }
 }

@@ -146,6 +146,10 @@ public class MCPProtocol {
      * Build a tool call result with JSON data.
      */
     public static Map<String, Object> buildToolCallResultJson(Object data) {
+        return buildToolCallResultJson(data, false);
+    }
+
+    public static Map<String, Object> buildToolCallResultJson(Object data, boolean isError) {
         Map<String, Object> result = new HashMap<>();
 
         List<Map<String, Object>> content = new ArrayList<>();
@@ -155,6 +159,7 @@ public class MCPProtocol {
         content.add(textContent);
 
         result.put("content", content);
+        if (isError) result.put("isError", true);
 
         return result;
     }

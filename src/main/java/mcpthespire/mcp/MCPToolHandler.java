@@ -8,6 +8,7 @@ import com.megacrit.cardcrawl.rooms.AbstractRoom;
 import mcpthespire.ChoiceScreenUtils;
 import mcpthespire.CommandExecutor;
 import mcpthespire.GameStateConverter;
+import mcpthespire.ProfileStateConverter;
 import mcpthespire.GameStateListener;
 import mcpthespire.InvalidCommandException;
 import mcpthespire.MCPTheSpire;
@@ -31,6 +32,8 @@ public class MCPToolHandler {
     private static final Set<String> READ_ONLY_TOOLS = new HashSet<>(Arrays.asList(
         "get_game_state",
         "get_map",
+        "get_piles",
+        "get_profile_progress",
         "get_screen_state",
         "get_available_commands",
         "get_card_info",
@@ -83,6 +86,29 @@ public class MCPToolHandler {
             "get_map",
             "Get the full visible act map with room coordinates, directed paths, current position, and 1-indexed next route choices. Use before choosing a path.",
             MCPProtocol.createInputSchema(new HashMap<>(), null)
+        ));
+
+        tools.add(MCPProtocol.createToolDefinition(
+            "get_piles",
+            "Get visible combat pile contents. Draw-pile cards are unordered because their exact draw order is hidden in the game.",
+            MCPProtocol.createInputSchema(new HashMap<>(), null)
+        ));
+
+        Map<String, Object> progressProps = new HashMap<>();
+        progressProps.put("include_cards", MCPProtocol.createProperty("boolean", "Include every card in each character's catalog, not just locked cards"));
+        progressProps.put("include_achievements", MCPProtocol.createProperty("boolean", "Include achievement names and unlock states"));
+        tools.add(MCPProtocol.createToolDefinition(
+            "get_profile_progress",
+            "Read the active profile's character statistics, unlock progression, locked cards/relics, and optional full card and achievement catalogs. Works from the menu or during a run.",
+            MCPProtocol.createInputSchema(progressProps, null)
+        ));
+
+        Map<String, Object> actionStatusProps = new HashMap<>();
+        actionStatusProps.put("operation_id", MCPProtocol.createProperty("string", "ID returned by a still-running action"));
+        tools.add(MCPProtocol.createToolDefinition(
+            "get_action_status",
+            "Get the final result of an action that outlasted the request wait. Never replay the action just because its response was pending.",
+            MCPProtocol.createInputSchema(actionStatusProps, Arrays.asList("operation_id"))
         ));
 
         // get_screen_state - Recommended for most queries
@@ -160,7 +186,7 @@ public class MCPToolHandler {
         executeActionsProps.put("actions", actionsArrayProp);
         tools.add(MCPProtocol.createToolDefinition(
             "execute_actions",
-            "Execute multiple actions in sequence. INDICES ARE STABLE - use positions at call time, don't recalculate! " +
+            "Execute actions in sequence, waiting for each to settle and returning per-action before/after state. Stops when the screen or enemy intent changes so you can reassess. INDICES ARE STABLE - use positions at call time, don't recalculate! " +
             "Examples: " +
             "(1) Play cards by name: [{action:'play_card',card_name:'Bash',target_index:1},{action:'play_card',card_name:'Strike',target_index:1}]. " +
             "(2) Play by index (stable): Hand [1:Strike,2:Defend,3:Bash] -> play 1 and 3: [{action:'play_card',card_index:1,target_index:1},{action:'play_card',card_index:3,target_index:1}]. " +
@@ -280,7 +306,7 @@ public class MCPToolHandler {
         // save_game - Save game
         tools.add(MCPProtocol.createToolDefinition(
             "save_game",
-            "Save the current run and return to main menu. Only available while in a dungeon run.",
+            "Exit the current run to the main menu. Continue restores the game's latest autosave checkpoint; choices in the current room may need to be repeated.",
             MCPProtocol.createInputSchema(new HashMap<>(), null)
         ));
 
@@ -298,6 +324,14 @@ public class MCPToolHandler {
 
                 case "get_map":
                     return MCPProtocol.buildToolCallResultJson(GameStateConverter.getMapState());
+
+                case "get_piles":
+                    return MCPProtocol.buildToolCallResultJson(GameStateConverter.getPilesState());
+
+                case "get_profile_progress":
+                    return MCPProtocol.buildToolCallResultJson(ProfileStateConverter.getProfileProgress(
+                        arguments != null && arguments.has("include_cards") && arguments.get("include_cards").getAsBoolean(),
+                        arguments != null && arguments.has("include_achievements") && arguments.get("include_achievements").getAsBoolean()));
 
                 case "get_screen_state":
                     return executeGetScreenState();
@@ -383,7 +417,8 @@ public class MCPToolHandler {
 
     private Map<String, Object> executeGetAvailableCommands() {
         Map<String, Object> result = new HashMap<>();
-        result.put("ready_for_command", GameStateListener.isWaitingForCommand());
+        result.put("ready_for_command", GameStateListener.isCommandReadyNow());
+        result.put("readiness", GameStateListener.getReadinessReason());
 
         boolean isInGame = CommandExecutor.isInDungeon();
         result.put("in_game", isInGame);
@@ -433,6 +468,13 @@ public class MCPToolHandler {
                 availableTools.add(tool);
             }
 
+            if (AbstractDungeon.getCurrRoom().phase == AbstractRoom.RoomPhase.COMBAT) {
+                Map<String, Object> piles = new HashMap<>();
+                piles.put("tool", "get_piles");
+                piles.put("description", "Inspect visible draw, discard, and exhaust piles");
+                availableTools.add(piles);
+            }
+
             // Proceed button
             if (ChoiceScreenUtils.isConfirmButtonAvailable()) {
                 Map<String, Object> tool = new HashMap<>();
@@ -448,6 +490,16 @@ public class MCPToolHandler {
                 tool.put("description", "Click " + ChoiceScreenUtils.getCancelButtonText() + " button");
                 availableTools.add(tool);
             }
+
+            Map<String, Object> progress = new HashMap<>();
+            progress.put("tool", "get_profile_progress");
+            progress.put("description", "Inspect character statistics and unlocks");
+            availableTools.add(progress);
+
+            Map<String, Object> save = new HashMap<>();
+            save.put("tool", "save_game");
+            save.put("description", "Return to menu; Continue restores the latest autosave checkpoint");
+            availableTools.add(save);
 
             result.put("available_tools", availableTools);
         } else {
@@ -471,6 +523,11 @@ public class MCPToolHandler {
             startT.put("tool", "start_game");
             startT.put("description", "Start new game with character");
             availableTools.add(startT);
+
+            Map<String, Object> progress = new HashMap<>();
+            progress.put("tool", "get_profile_progress");
+            progress.put("description", "Inspect profile statistics and character unlocks");
+            availableTools.add(progress);
 
             result.put("available_tools", availableTools);
         }
@@ -914,17 +971,20 @@ public class MCPToolHandler {
 
     private Map<String, Object> executeContinueGame() throws InvalidCommandException {
         CommandExecutor.executeCommand("continue");
+        GameStateListener.registerCommandExecution();
         return MCPProtocol.buildToolCallResult("Continuing saved game", false);
     }
 
     private Map<String, Object> executeAbandonRun() throws InvalidCommandException {
         CommandExecutor.executeCommand("abandon");
+        GameStateListener.registerCommandExecution();
         return MCPProtocol.buildToolCallResult("Run abandoned", false);
     }
 
     private Map<String, Object> executeSaveGame() throws InvalidCommandException {
         CommandExecutor.executeCommand("save");
-        return MCPProtocol.buildToolCallResult("Game saved", false);
+        GameStateListener.registerCommandExecution();
+        return MCPProtocol.buildToolCallResult("Returned to menu; Continue uses the latest autosave checkpoint", false);
     }
 
     /**

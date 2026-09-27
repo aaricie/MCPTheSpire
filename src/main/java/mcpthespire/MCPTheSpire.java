@@ -81,9 +81,7 @@ public class MCPTheSpire implements PostInitializeSubscriber, PostUpdateSubscrib
     public void receivePreUpdate() {
         // Process any pending MCP tool calls on the game thread
         if (mcpServer != null && mcpServer.hasPendingToolCalls()) {
-            logger.info("Processing pending MCP tool call on game thread");
             mcpServer.processPendingToolCalls();
-            logger.info("Finished processing MCP tool call");
         }
     }
 
@@ -97,7 +95,6 @@ public class MCPTheSpire implements PostInitializeSubscriber, PostUpdateSubscrib
     public void receivePostUpdate() {
         // Also process MCP tool calls here in case PreUpdate isn't called
         if (mcpServer != null && mcpServer.hasPendingToolCalls()) {
-            logger.info("Processing pending MCP tool call in PostUpdate");
             mcpServer.processPendingToolCalls();
         }
 
@@ -122,10 +119,7 @@ public class MCPTheSpire implements PostInitializeSubscriber, PostUpdateSubscrib
 
     @Override
     public void receivePostRender(SpriteBatch sb) {
-        // Process MCP tool calls during render - this is called even in menus
-        if (mcpServer != null && mcpServer.hasPendingToolCalls()) {
-            mcpServer.processPendingToolCalls();
-        }
+        if (mcpServer != null) mcpServer.onPostRender();
     }
 
     private void setUpOptionsMenu() {

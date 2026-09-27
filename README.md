@@ -76,7 +76,7 @@ For Claude Desktop, add to your MCP config:
 
 ## MCP Tools Reference
 
-### State Query Tools (Read-only, instant response)
+### State Query Tools (Read-only)
 
 #### `get_game_state`
 Get complete game state with optional filtering.
@@ -93,6 +93,15 @@ Get complete game state with optional filtering.
 #### `get_map`
 Get the full visible route graph for the current act, including room coordinates/types, connections, the current node, and `choice_index` values for the next reachable nodes. This is the simplest way to plan a path; call it again after moving to a new act.
 
+#### `get_piles`
+Get the cards currently visible in the draw, discard, and exhaust piles during combat. The draw-pile list is deliberately unordered because the game does not show its exact draw order.
+
+#### `get_profile_progress`
+Read character statistics and unlock progress for the active save slot, even at the main menu. The default response includes each character's wins, deaths, playtime, ascension, next unlock bundle, and locked cards, plus locked relics. Set `include_cards: true` for the complete per-character card catalogs or `include_achievements: true` for achievement details. This reports progress without navigating the Statistics screens or finishing a run.
+
+#### `get_action_status`
+If an action returns `status: "queued"` or `"resolving"`, pass its `operation_id` to this tool for the final result. A pending response does not mean the action failed; do not submit it again blindly.
+
 #### `get_screen_state`
 Get lightweight current screen state. **Recommended for most use cases.**
 
@@ -102,7 +111,12 @@ Get lightweight current screen state. **Recommended for most use cases.**
 - `choice_list`: Available choices
 - `can_proceed` / `can_cancel`: Button availability
 - `hand`, `monsters`, `energy`: Combat info (if in combat)
+- `cards_played_this_turn` and, with Velvet Choker, `card_play_limit` / `card_plays_remaining`
+- `pile_counts`: Draw, discard, and exhaust pile sizes
+- `readiness`: Why the game is ready or still resolving
 - Player powers/block, potion descriptions, card descriptions, and monster attack details (if in combat)
+
+On `HAND_SELECT`, `screen_state.eligible_choices` lists selectable cards, while `screen_state.full_hand_before_selection` preserves the hand before the game filtered those choices. On game-over screens, `screen_name` is normalized to `VICTORY` or `DEFEAT`; `raw_screen_name` preserves the game's internal label.
 
 #### `get_available_commands`
 Get context-aware list of available tools for current screen.
@@ -163,7 +177,7 @@ Execute multiple actions in sequence. **This is the most efficient way to play.*
 
 Pass action objects, not JSON strings: `{"actions":[{"action":"play_card","card_index":1,"target_index":1},{"action":"end_turn"}]}`.
 
-Actions wait for the game to be ready (animations complete, state updated) before each execution. This ensures reliable execution without manual timing.
+Actions wait for the game to be ready (animations complete, state updated) before each execution and before returning. Each action includes compact `before` and `after` states. A batch stops early if the screen or a visible enemy intent changes, so the caller can reconsider the remaining actions.
 
 **Key Feature: Stable Indices** - All `card_index` and `choice_index` values refer to positions **at the time you called the tool**, not after each action executes. You don't need to recalculate indices as cards are played or choices are made.
 
@@ -308,34 +322,29 @@ Cards can be specified by:
 ```json
 {
   "actions": [
-    {"action": "select_cards", "keep": ["Bash", "Inflame"]},
-    {"action": "play_card", "card_name": "Bash"}
+    {"action": "select_cards", "keep": ["Bash", "Inflame"]}
   ]
 }
 ```
+Inspect the settled hand before submitting the next play.
 
 **Returns:**
 ```json
 {
-  "success": true,
-  "message": "Executed 4 actions",
-  "screen": "NONE",
-  "hand_size": 2,
-  "energy": 0,
-  "can_proceed": false
+  "status": "ready",
+  "settled": true,
+  "actions_requested": 2,
+  "actions_completed": 2,
+  "partial": false,
+  "actions": [
+    {"index": 1, "action": {"action": "play_card", "card_name": "Defend"}, "before": {}, "after": {}},
+    {"index": 2, "action": {"action": "end_turn"}, "before": {}, "after": {}}
+  ],
+  "after": {}
 }
 ```
 
-On error:
-```json
-{
-  "success": false,
-  "executed": 2,
-  "failed_at": 2,
-  "failed_action": "play_card",
-  "error": "Card not playable"
-}
-```
+On error, the response has `status: "error"`, `failed_index` (1-indexed), `failed_action`, and `error`. On an expected early stop, `partial: true` and `stop_reason` explain why. A transition lasting more than the request's 20-second wait returns a pending `operation_id`; poll with `get_action_status`.
 
 ### Individual Action Tools
 
@@ -392,7 +401,7 @@ Continue from save file.
 Abandon current run.
 
 #### `save_game`
-Save and return to menu.
+Return to the main menu. Continue restores the game's latest autosave checkpoint; choices made since that checkpoint may need to be repeated. To preserve rewards from a room, advance to the next room before leaving.
 
 ## Screen Types Reference
 

@@ -14,13 +14,22 @@ import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * MCP Server implementation using Streamable HTTP transport.
@@ -42,19 +51,23 @@ public class MCPServer implements Runnable {
 
     // Queue for pending tool calls that need to be executed on the game thread
     private final BlockingQueue<PendingToolCall> pendingToolCalls;
-    private final BlockingQueue<Map<String, Object>> toolCallResults;
+    private final Map<String, PendingToolCall> operations = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedQueue<String> completedOperationIds = new ConcurrentLinkedQueue<>();
+    private static final int MAX_COMPLETED_OPERATIONS = 128;
+    private static final long HTTP_WAIT_MS = 20000;
+    private static final long MAX_WAIT_FOR_READY_MS = 15000;
+    private static final long MAX_SETTLE_MS = 30000;
+    private static final long MIN_SETTLE_MS = 100;
+    private volatile PendingToolCall activeCall;
+    private long renderFrame;
 
     // Serialize tool handler execution to avoid cross-thread reads during game mutation/rendering
     private final Object toolExecutionLock = new Object();
 
     // Pending batch execution state (for execute_actions across multiple frames)
-    private PendingBatchExecution pendingBatch = null;
+    private volatile PendingBatchExecution pendingBatch = null;
     private long lastBatchActionTime = 0;
-    private static final long MIN_BATCH_ACTION_INTERVAL_MS = 50; // Minimum time between batch actions
-    private static final long MAX_WAIT_FOR_READY_MS = 10000; // Maximum time to wait for ready_for_command
-
-    // Waiting for ready state
-    private long waitStartTime = 0;
+    private static final long MIN_BATCH_ACTION_INTERVAL_MS = 50;
 
     public MCPServer() {
         this("127.0.0.1", 8080);
@@ -69,7 +82,6 @@ public class MCPServer implements Runnable {
         this.port = port;
         this.toolHandler = new MCPToolHandler();
         this.pendingToolCalls = new LinkedBlockingQueue<>();
-        this.toolCallResults = new LinkedBlockingQueue<>();
     }
 
     @Override
@@ -269,6 +281,10 @@ public class MCPServer implements Runnable {
 
         logger.info("Tool call: " + toolName + " with args: " + arguments);
 
+        if ("get_action_status".equals(toolName)) {
+            return MCPProtocol.buildResponse(id, getActionStatus(arguments));
+        }
+
         // Execute only tools that are explicitly safe on the HTTP thread.
         // Some read-only tools still access live game/UI state and must run on the game thread.
         if (toolHandler.isHttpThreadSafeTool(toolName)) {
@@ -286,52 +302,64 @@ public class MCPServer implements Runnable {
         }
 
         // Queue the tool call for execution on the game thread
-        PendingToolCall pending = new PendingToolCall(id, toolName, arguments);
+        PendingToolCall pending = new PendingToolCall(toolName, arguments);
+        operations.put(pending.operationId, pending);
         pendingToolCalls.add(pending);
         logger.info("Tool call queued for game thread, pending count: " + pendingToolCalls.size());
 
-        // Wait for result (with timeout)
         try {
-            Map<String, Object> result = toolCallResults.poll(30, TimeUnit.SECONDS);
-            if (result == null) {
-                logger.error("Tool execution timeout - game thread did not process in 30 seconds");
-                return MCPProtocol.buildErrorResponse(id, MCPProtocol.ERROR_INTERNAL,
-                    "Tool execution timeout - ensure the game is running and not paused");
-            }
+            Map<String, Object> result = pending.result.get(HTTP_WAIT_MS, TimeUnit.MILLISECONDS);
             logger.info("Tool call completed: " + toolName);
             return MCPProtocol.buildResponse(id, result);
+        } catch (TimeoutException e) {
+            return MCPProtocol.buildResponse(id, MCPProtocol.buildToolCallResultJson(pendingStatus(pending)));
+        } catch (ExecutionException e) {
+            return MCPProtocol.buildResponse(id, MCPProtocol.buildToolCallResult("Error: " + e.getCause(), true));
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             return MCPProtocol.buildErrorResponse(id, MCPProtocol.ERROR_INTERNAL, "Tool execution interrupted");
         }
     }
 
-    /**
-     * Check if we should wait for ready_for_command before executing.
-     * Returns true if we should wait (i.e., skip this frame), false if ready to execute.
-     */
-    private boolean shouldWaitForReady() {
-        if (mcpthespire.GameStateListener.isWaitingForCommand()) {
-            // Ready to execute, reset wait timer
-            waitStartTime = 0;
-            return false;
+    private Map<String, Object> getActionStatus(JsonObject arguments) {
+        if (arguments == null || !arguments.has("operation_id") || arguments.get("operation_id").isJsonNull()) {
+            return MCPProtocol.buildToolCallResult("operation_id is required", true);
         }
-
-        // Not ready - check if we've been waiting too long
-        long now = System.currentTimeMillis();
-        if (waitStartTime == 0) {
-            waitStartTime = now;
-            logger.info("Waiting for ready_for_command...");
+        PendingToolCall pending = operations.get(arguments.get("operation_id").getAsString());
+        if (pending == null) {
+            return MCPProtocol.buildToolCallResult("Unknown or expired operation_id", true);
         }
+        return pending.result.isDone()
+            ? pending.result.getNow(MCPProtocol.buildToolCallResult("Result unavailable", true))
+            : MCPProtocol.buildToolCallResultJson(pendingStatus(pending));
+    }
 
-        if (now - waitStartTime > MAX_WAIT_FOR_READY_MS) {
-            // Timeout - proceed anyway
-            logger.warn("Timeout waiting for ready_for_command, proceeding anyway");
-            waitStartTime = 0;
-            return false;
+    private Map<String, Object> pendingStatus(PendingToolCall pending) {
+        Map<String, Object> status = new HashMap<>();
+        status.put("operation_id", pending.operationId);
+        status.put("status", pending.started ? "resolving" : "queued");
+        status.put("settled", false);
+        status.put("tool", pending.toolName);
+        if (pending == activeCall && pendingBatch != null) {
+            status.put("actions_completed", pendingBatch.successCount);
+            status.put("actions_requested", pendingBatch.actions.size());
         }
+        return status;
+    }
 
-        // Still waiting
-        return true;
+    private void completeCall(PendingToolCall pending, Map<String, Object> result) {
+        pending.result.complete(result);
+        completedOperationIds.add(pending.operationId);
+        while (completedOperationIds.size() > MAX_COMPLETED_OPERATIONS) {
+            String expired = completedOperationIds.poll();
+            if (expired != null) operations.remove(expired);
+        }
+        if (activeCall == pending) activeCall = null;
+    }
+
+    public void onPostRender() {
+        renderFrame++;
+        if (hasPendingToolCalls()) processPendingToolCalls();
     }
 
     /**
@@ -339,43 +367,52 @@ public class MCPServer implements Runnable {
      * This should be called from the game's update loop.
      */
     public void processPendingToolCalls() {
-        // First, continue any pending batch execution
-        if (pendingBatch != null) {
-            processBatchAction();
+        if (activeCall != null) {
+            if (activeCall.awaitingSettle) {
+                processSettlement();
+            } else if (pendingBatch != null) {
+                processBatchAction();
+            }
             return;
         }
 
-        // Then, check for new tool calls
-        PendingToolCall pending = pendingToolCalls.peek(); // peek first, don't remove yet
-        if (pending != null) {
-            // For game-modifying tools, wait for ready_for_command
-            if (!toolHandler.isReadOnlyTool(pending.toolName)) {
-                if (shouldWaitForReady()) {
-                    return; // Not ready, try again next frame
-                }
+        PendingToolCall pending = pendingToolCalls.peek();
+        if (pending == null) return;
+        if (!toolHandler.isReadOnlyTool(pending.toolName) &&
+            !mcpthespire.GameStateListener.isCommandReadyNow()) {
+            if (System.currentTimeMillis() - pending.queuedAt > MAX_WAIT_FOR_READY_MS) {
+                pendingToolCalls.poll();
+                completeCall(pending, MCPProtocol.buildToolCallResult(
+                    "Game not ready; command was not executed (" +
+                    mcpthespire.GameStateListener.getReadinessReason() + ")", true));
             }
-
-            // Now remove from queue
-            pendingToolCalls.poll();
-            logger.info("Game thread processing tool: " + pending.toolName);
-
-            // Special handling for execute_actions - use async batch execution
+            return;
+        }
+        pendingToolCalls.poll();
+        pending.started = true;
+        activeCall = pending;
+        logger.info("Game thread processing tool: " + pending.toolName);
+        try {
             if ("execute_actions".equals(pending.toolName)) {
                 startBatchExecution(pending.arguments);
                 return;
             }
-
-            try {
-                Map<String, Object> result;
-                synchronized (toolExecutionLock) {
-                    result = toolHandler.executeTool(pending.toolName, pending.arguments);
-                }
-                toolCallResults.add(result);
-                logger.info("Tool result added to queue");
-            } catch (Exception e) {
-                logger.error("Error executing tool: " + pending.toolName, e);
-                toolCallResults.add(MCPProtocol.buildToolCallResult("Error: " + e.getMessage(), true));
+            if (!toolHandler.isReadOnlyTool(pending.toolName)) {
+                pending.before = mcpthespire.GameStateConverter.getActionSummary();
             }
+            Map<String, Object> result;
+            synchronized (toolExecutionLock) {
+                result = toolHandler.executeTool(pending.toolName, pending.arguments);
+            }
+            if (toolHandler.isReadOnlyTool(pending.toolName) || Boolean.TRUE.equals(result.get("isError"))) {
+                completeCall(pending, result);
+            } else {
+                pending.acknowledgement = result;
+                markDispatched(pending, 0);
+            }
+        } catch (Exception e) {
+            logger.error("Error executing tool: " + pending.toolName, e);
+            completeCall(pending, MCPProtocol.buildToolCallResult("Error: " + e.getMessage(), true));
         }
     }
 
@@ -384,7 +421,7 @@ public class MCPServer implements Runnable {
      */
     private void startBatchExecution(JsonObject params) {
         if (params == null || !params.has("actions") || !params.get("actions").isJsonArray()) {
-            toolCallResults.add(MCPProtocol.buildToolCallResult("Error: 'actions' array is required", true));
+            completeCall(activeCall, MCPProtocol.buildToolCallResult("Error: 'actions' array is required", true));
             return;
         }
 
@@ -392,18 +429,16 @@ public class MCPServer implements Runnable {
         try {
             actions = normalizeBatchActions(params.getAsJsonArray("actions"));
         } catch (IllegalArgumentException e) {
-            toolCallResults.add(MCPProtocol.buildToolCallResult("Error: " + e.getMessage(), true));
+            completeCall(activeCall, MCPProtocol.buildToolCallResult("Error: " + e.getMessage(), true));
             return;
         }
         if (actions.size() == 0) {
-            toolCallResults.add(MCPProtocol.buildToolCallResult("Error: 'actions' array is empty", true));
+            completeCall(activeCall, MCPProtocol.buildToolCallResult("Error: 'actions' array is empty", true));
             return;
         }
 
         logger.info("Starting batch execution with " + actions.size() + " actions");
         pendingBatch = new PendingBatchExecution(actions);
-
-        // Execute first action immediately
         processBatchAction();
     }
 
@@ -438,22 +473,12 @@ public class MCPServer implements Runnable {
     private void processBatchAction() {
         if (pendingBatch == null) return;
 
-        // Check if we should stop
         if (!pendingBatch.hasMoreActions()) {
             finishBatchExecution();
             return;
         }
-
-        // Wait for ready_for_command (except for the first action which was already checked)
-        if (pendingBatch.currentIndex > 0 && shouldWaitForReady()) {
-            return; // Not ready, try again next frame
-        }
-
-        // Rate limit: ensure minimum time between batch actions
-        // This gives the game time to process card queue, animations, etc.
         long now = System.currentTimeMillis();
         if (pendingBatch.currentIndex > 0 && (now - lastBatchActionTime) < MIN_BATCH_ACTION_INTERVAL_MS) {
-            // Not enough time has passed since last action, skip this call
             return;
         }
 
@@ -462,10 +487,11 @@ public class MCPServer implements Runnable {
             JsonObject action = pendingBatch.getCurrentAction();
             actionType = action.get("action").getAsString();
             logger.info("Batch executing action " + (pendingBatch.currentIndex + 1) + "/" + pendingBatch.actions.size() + ": " + actionType);
+            pendingBatch.actionBefore = mcpthespire.GameStateConverter.getActionSummary();
             if ("wait".equals(actionType)) {
-                // Wait action doesn't need frame delay, just a sleep
                 int waitMs = action.has("ms") ? action.get("ms").getAsInt() : 100;
-                Thread.sleep(Math.min(waitMs, 500));
+                if (waitMs < 0) throw new IllegalArgumentException("wait ms must be nonnegative");
+                markDispatched(activeCall, Math.min(waitMs, 500));
             } else {
                 // For play_card with card_index, convert to card_uuid for stable resolution
                 JsonObject processedAction = action;
@@ -537,22 +563,130 @@ public class MCPServer implements Runnable {
 
                 // Execute the single action
                 toolHandler.executeSingleBatchAction(actionType, processedAction);
+                markDispatched(activeCall, 0);
             }
-            pendingBatch.markSuccess();
             lastBatchActionTime = System.currentTimeMillis();
-
-            // Check if screen changed (stop execution if it did)
-            pendingBatch.checkScreenChange();
-
-            // If no more actions, finish now
-            if (!pendingBatch.hasMoreActions()) {
-                finishBatchExecution();
-            }
-            // Otherwise, next action will be processed in next frame
         } catch (Exception e) {
             pendingBatch.markError(actionType, e.getMessage());
             finishBatchExecution();
         }
+    }
+
+    private void markDispatched(PendingToolCall call, int extraWaitMs) {
+        call.awaitingSettle = true;
+        call.dispatchedAt = System.currentTimeMillis();
+        call.readyAfter = call.dispatchedAt + Math.max(MIN_SETTLE_MS, extraWaitMs);
+        call.dispatchedFrame = renderFrame;
+        call.lastObservedFrame = -1;
+        call.readyFrames = 0;
+        call.observedBusy = !mcpthespire.GameStateListener.isCommandReadyNow();
+    }
+
+    private void processSettlement() {
+        PendingToolCall call = activeCall;
+        long now = System.currentTimeMillis();
+        if (now - call.dispatchedAt > MAX_SETTLE_MS) {
+            if (pendingBatch != null) {
+                pendingBatch.markError(pendingBatch.getCurrentAction().get("action").getAsString(),
+                    "Timed out waiting for a command-ready state after this action; do not replay it blindly");
+                finishBatchExecution();
+            } else {
+                Map<String, Object> response = settledResponse(call, safeActionSummary(), false);
+                response.put("error", "Timed out waiting for a command-ready state; do not replay this action blindly");
+                completeCall(call, MCPProtocol.buildToolCallResultJson(response, true));
+            }
+            return;
+        }
+        if (renderFrame <= call.dispatchedFrame || renderFrame == call.lastObservedFrame || now < call.readyAfter) return;
+        call.lastObservedFrame = renderFrame;
+        boolean ready = mcpthespire.GameStateListener.isCommandReadyNow();
+        if (!ready) call.observedBusy = true;
+        call.readyFrames = ready ? call.readyFrames + 1 : 0;
+        if (call.readyFrames < 2) return;
+
+        Map<String, Object> after = safeActionSummary();
+        Map<String, Object> before = pendingBatch == null ? call.before : pendingBatch.actionBefore;
+        boolean isWait = pendingBatch != null &&
+            "wait".equals(pendingBatch.getCurrentAction().get("action").getAsString());
+        if (!isWait && (!call.observedBusy && Objects.equals(before, after) ||
+            !destinationReached(call.toolName, after))) return;
+        call.awaitingSettle = false;
+        if (pendingBatch != null) {
+            Map<String, Object> actionResult = new HashMap<>();
+            actionResult.put("index", pendingBatch.currentIndex + 1);
+            actionResult.put("action", pendingBatch.getCurrentAction());
+            actionResult.put("before", pendingBatch.actionBefore);
+            actionResult.put("after", after);
+            pendingBatch.actionResults.add(actionResult);
+            boolean intentChanged = enemyIntentChanged(pendingBatch.actionBefore, after);
+            pendingBatch.markSuccess();
+            pendingBatch.checkScreenChange();
+            if (intentChanged && pendingBatch.hasMoreActions()) {
+                pendingBatch.stopReason = "enemy_intent_changed";
+            }
+            if (!pendingBatch.hasMoreActions() || pendingBatch.stopReason != null) finishBatchExecution();
+        } else {
+            completeCall(call, MCPProtocol.buildToolCallResultJson(settledResponse(call, after, true)));
+        }
+    }
+
+    private Map<String, Object> safeActionSummary() {
+        try {
+            return mcpthespire.GameStateConverter.getActionSummary();
+        } catch (Exception e) {
+            Map<String, Object> state = new HashMap<>();
+            state.put("readiness", mcpthespire.GameStateListener.getReadinessReason());
+            state.put("state_error", e.getMessage());
+            return state;
+        }
+    }
+
+    static boolean destinationReached(String tool, Map<String, Object> state) {
+        if ("start_game".equals(tool) || "continue_game".equals(tool)) {
+            return Boolean.TRUE.equals(state.get("in_game"));
+        }
+        if ("save_game".equals(tool)) {
+            return Boolean.FALSE.equals(state.get("in_game")) &&
+                "MAIN_MENU".equals(state.get("screen_type"));
+        }
+        if ("abandon_run".equals(tool)) {
+            return Boolean.FALSE.equals(state.get("in_game")) &&
+                Boolean.FALSE.equals(state.get("save_file_exists"));
+        }
+        return true;
+    }
+
+    private Map<String, Object> settledResponse(PendingToolCall call, Map<String, Object> after, boolean settled) {
+        Map<String, Object> response = new HashMap<>();
+        response.put("operation_id", call.operationId);
+        response.put("status", settled ? "ready" : "unsettled");
+        response.put("settled", settled);
+        response.put("before", call.before);
+        response.put("after", after);
+        response.put("acknowledgement", call.acknowledgement);
+        return response;
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean enemyIntentChanged(Map<String, Object> before, Map<String, Object> after) {
+        Object oldMonsters = before.get("monsters");
+        Object newMonsters = after.get("monsters");
+        if (!(oldMonsters instanceof List) || !(newMonsters instanceof List)) return false;
+        Map<String, Object> oldIntents = new HashMap<>();
+        for (Object value : (List<?>) oldMonsters) {
+            Map<String, Object> monster = (Map<String, Object>) value;
+            oldIntents.put(monster.get("id").toString(), intentSignature(monster));
+        }
+        for (Object value : (List<?>) newMonsters) {
+            Map<String, Object> monster = (Map<String, Object>) value;
+            String id = monster.get("id").toString();
+            if (oldIntents.containsKey(id) && !Objects.equals(oldIntents.get(id), intentSignature(monster))) return true;
+        }
+        return false;
+    }
+
+    private String intentSignature(Map<String, Object> monster) {
+        return String.valueOf(monster.get("intent")) + ":" + String.valueOf(monster.get("move"));
     }
 
     /**
@@ -560,22 +694,26 @@ public class MCPServer implements Runnable {
      */
     private void finishBatchExecution() {
         if (pendingBatch == null) return;
-
-        int total = pendingBatch.actions.size();
-        String message;
-
-        if (pendingBatch.errorMessage == null) {
-            if (pendingBatch.screenChanged && pendingBatch.successCount < total) {
-                message = "OK " + pendingBatch.successCount + "/" + total + " (screen changed)";
-            } else {
-                message = "OK";
-            }
-        } else {
-            message = "Error at action " + (pendingBatch.failedIndex + 1) + ": " + pendingBatch.errorMessage;
+        Map<String, Object> response = new HashMap<>();
+        response.put("operation_id", activeCall.operationId);
+        response.put("status", pendingBatch.errorMessage == null ? "ready" : "error");
+        response.put("settled", pendingBatch.errorMessage == null);
+        response.put("actions_requested", pendingBatch.actions.size());
+        response.put("actions_completed", pendingBatch.successCount);
+        response.put("actions", pendingBatch.actionResults);
+        response.put("partial", pendingBatch.successCount < pendingBatch.actions.size());
+        if (pendingBatch.screenChanged && pendingBatch.successCount < pendingBatch.actions.size()) {
+            response.put("stop_reason", "screen_changed");
         }
-
-        logger.info("Batch execution finished: " + pendingBatch.successCount + "/" + total);
-        toolCallResults.add(MCPProtocol.buildToolCallResult(message, pendingBatch.errorMessage != null));
+        if (pendingBatch.stopReason != null) response.put("stop_reason", pendingBatch.stopReason);
+        if (pendingBatch.errorMessage != null) {
+            response.put("failed_index", pendingBatch.failedIndex + 1);
+            response.put("failed_action", pendingBatch.failedAction);
+            response.put("error", pendingBatch.errorMessage);
+        }
+        response.put("after", safeActionSummary());
+        logger.info("Batch execution finished: " + pendingBatch.successCount + "/" + pendingBatch.actions.size());
+        completeCall(activeCall, MCPProtocol.buildToolCallResultJson(response, pendingBatch.errorMessage != null));
         pendingBatch = null;
     }
 
@@ -623,7 +761,7 @@ public class MCPServer implements Runnable {
      * Check if there are pending tool calls or batch actions to process.
      */
     public boolean hasPendingToolCalls() {
-        return !pendingToolCalls.isEmpty() || pendingBatch != null;
+        return !pendingToolCalls.isEmpty() || activeCall != null;
     }
 
     public String getHost() {
@@ -636,6 +774,11 @@ public class MCPServer implements Runnable {
 
     public void stop() {
         running = false;
+        for (PendingToolCall call : operations.values()) {
+            if (!call.result.isDone()) {
+                completeCall(call, MCPProtocol.buildToolCallResult("Server stopped before operation completed", true));
+            }
+        }
         if (httpServer != null) {
             httpServer.stop(0);
         }
@@ -648,12 +791,23 @@ public class MCPServer implements Runnable {
      * Represents a pending tool call waiting to be executed on the game thread.
      */
     private static class PendingToolCall {
-        final JsonElement id;
+        final String operationId = UUID.randomUUID().toString();
         final String toolName;
         final JsonObject arguments;
+        final long queuedAt = System.currentTimeMillis();
+        final CompletableFuture<Map<String, Object>> result = new CompletableFuture<>();
+        volatile boolean started;
+        boolean awaitingSettle;
+        long dispatchedAt;
+        long readyAfter;
+        long dispatchedFrame;
+        long lastObservedFrame;
+        int readyFrames;
+        boolean observedBusy;
+        Map<String, Object> before;
+        Map<String, Object> acknowledgement;
 
-        PendingToolCall(JsonElement id, String toolName, JsonObject arguments) {
-            this.id = id;
+        PendingToolCall(String toolName, JsonObject arguments) {
             this.toolName = toolName;
             this.arguments = arguments;
         }
@@ -670,6 +824,9 @@ public class MCPServer implements Runnable {
         String failedAction;
         String errorMessage;
         boolean screenChanged;
+        String stopReason;
+        Map<String, Object> actionBefore;
+        final List<Map<String, Object>> actionResults = new ArrayList<>();
         mcpthespire.ChoiceScreenUtils.ChoiceType initialScreen;
         boolean initialInDungeon;
         // Initial hand UUIDs for stable card_index resolution
@@ -725,7 +882,10 @@ public class MCPServer implements Runnable {
             if (initialInDungeon && mcpthespire.CommandExecutor.isInDungeon()) {
                 mcpthespire.ChoiceScreenUtils.ChoiceType currentScreen = mcpthespire.ChoiceScreenUtils.getCurrentChoiceType();
                 if (initialScreen != currentScreen) {
-                    screenChanged = true;
+                    boolean nextIsHandSelection = currentIndex < actions.size() &&
+                        currentScreen == mcpthespire.ChoiceScreenUtils.ChoiceType.HAND_SELECT &&
+                        "select_cards".equals(actions.get(currentIndex).getAsJsonObject().get("action").getAsString());
+                    screenChanged = !nextIsHandSelection;
                 }
             }
         }

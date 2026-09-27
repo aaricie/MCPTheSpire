@@ -15,6 +15,10 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 public class MCPServerProtocolTest {
     private static final String INITIALIZE = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"protocol-test\",\"version\":\"1.0\"}}}";
@@ -55,16 +59,24 @@ public class MCPServerProtocolTest {
             JsonObject toolsResult = new JsonParser().parse(tools.body).getAsJsonObject()
                 .getAsJsonObject("result");
             JsonArray toolDefinitions = toolsResult.getAsJsonArray("tools");
-            require(tools.status == 200 && toolDefinitions.size() == 20,
+            require(tools.status == 200 && toolDefinitions.size() == 23,
                 "tool discovery should remain available after GET requests");
             JsonObject batchTool = null;
             boolean hasMapTool = false;
+            boolean hasPilesTool = false;
+            boolean hasProgressTool = false;
+            boolean hasActionStatusTool = false;
             for (int i = 0; i < toolDefinitions.size(); i++) {
                 JsonObject tool = toolDefinitions.get(i).getAsJsonObject();
                 if ("execute_actions".equals(tool.get("name").getAsString())) batchTool = tool;
                 if ("get_map".equals(tool.get("name").getAsString())) hasMapTool = true;
+                if ("get_piles".equals(tool.get("name").getAsString())) hasPilesTool = true;
+                if ("get_profile_progress".equals(tool.get("name").getAsString())) hasProgressTool = true;
+                if ("get_action_status".equals(tool.get("name").getAsString())) hasActionStatusTool = true;
             }
             require(hasMapTool, "full map tool should be discoverable");
+            require(hasPilesTool && hasProgressTool && hasActionStatusTool,
+                "pile, profile, and operation status tools should be discoverable");
             require(batchTool != null && "object".equals(batchTool.getAsJsonObject("inputSchema")
                 .getAsJsonObject("properties").getAsJsonObject("actions")
                 .getAsJsonObject("items").get("type").getAsString()),
@@ -81,6 +93,48 @@ public class MCPServerProtocolTest {
             } catch (IllegalArgumentException expected) {
                 require(expected.getMessage().contains("Action 1"), "validation should identify the bad action");
             }
+
+            Response unknownOperation = request(port, "POST",
+                "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"get_action_status\",\"arguments\":{\"operation_id\":\"missing\"}}}", null);
+            require(new JsonParser().parse(unknownOperation.body).getAsJsonObject()
+                .getAsJsonObject("result").get("isError").getAsBoolean(),
+                "unknown operation IDs should return a tool error");
+
+            CompletableFuture<Response> mapCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
+                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get_map\",\"arguments\":{}}}"));
+            CompletableFuture<Response> pilesCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
+                "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"get_piles\",\"arguments\":{}}}"));
+            CompletableFuture<Response> progressCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
+                "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"get_profile_progress\",\"arguments\":{}}}"));
+            long deadline = System.currentTimeMillis() + 1500;
+            while ((!mapCall.isDone() || !pilesCall.isDone() || !progressCall.isDone()) &&
+                System.currentTimeMillis() < deadline) {
+                if (server.hasPendingToolCalls()) server.processPendingToolCalls();
+                Thread.sleep(5);
+            }
+            JsonObject mapResponse = new JsonParser().parse(mapCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
+            JsonObject pilesResponse = new JsonParser().parse(pilesCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
+            JsonObject progressResponse = new JsonParser().parse(progressCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
+            require(mapResponse.get("id").getAsInt() == 4 && resultData(mapResponse).has("screen_type"),
+                "map call should receive its own result");
+            require(pilesResponse.get("id").getAsInt() == 5 && resultData(pilesResponse).has("available"),
+                "piles call should receive its own result");
+            require(progressResponse.get("id").getAsInt() == 6 && resultData(progressResponse).has("profile_slot"),
+                "profile call should receive its own result");
+
+            Map<String, Object> stillInRun = new HashMap<>();
+            stillInRun.put("in_game", true);
+            stillInRun.put("screen_type", "COMBAT_REWARD");
+            require(!MCPServer.destinationReached("save_game", stillInRun),
+                "save must not settle during an intermediate dungeon screen");
+            Map<String, Object> atMenu = new HashMap<>();
+            atMenu.put("in_game", false);
+            atMenu.put("screen_type", "MAIN_MENU");
+            atMenu.put("save_file_exists", true);
+            require(MCPServer.destinationReached("save_game", atMenu),
+                "save should settle when the main menu is reached");
+            require(!MCPServer.destinationReached("abandon_run", atMenu),
+                "abandon should wait until the save is gone");
 
             require(requestWithOrigin(port, "http://example.com") == 403,
                 "cross-origin requests should be rejected");
@@ -137,6 +191,20 @@ public class MCPServerProtocolTest {
             connection.getHeaderField("Mcp-Session-Id"));
         connection.disconnect();
         return response;
+    }
+
+    private static Response requestUnchecked(int port, String body) {
+        try {
+            return request(port, "POST", body, null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static JsonObject resultData(JsonObject response) {
+        String json = response.getAsJsonObject("result").getAsJsonArray("content")
+            .get(0).getAsJsonObject().get("text").getAsString();
+        return new JsonParser().parse(json).getAsJsonObject();
     }
 
     private static int requestWithOrigin(int port, String origin) throws Exception {
