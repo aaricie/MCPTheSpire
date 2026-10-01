@@ -15,8 +15,6 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -55,43 +53,53 @@ public class MCPServerProtocolTest {
                     "GET should return 405 when no SSE stream is offered");
             }
 
+            require(initResult.has("instructions") &&
+                initResult.get("instructions").getAsString().contains("1-based"),
+                "server should send usage instructions once at initialize");
+
             Response tools = request(port, "POST", TOOLS_LIST, null);
             JsonObject toolsResult = new JsonParser().parse(tools.body).getAsJsonObject()
                 .getAsJsonObject("result");
             JsonArray toolDefinitions = toolsResult.getAsJsonArray("tools");
-            require(tools.status == 200 && toolDefinitions.size() == 23,
-                "tool discovery should remain available after GET requests");
-            JsonObject batchTool = null;
-            boolean hasMapTool = false;
-            boolean hasPilesTool = false;
-            boolean hasProgressTool = false;
-            boolean hasActionStatusTool = false;
+            require(tools.status == 200 && toolDefinitions.size() == 9,
+                "tool discovery should list the 9 consolidated tools");
+            JsonObject actTool = null;
+            java.util.Set<String> names = new java.util.HashSet<>();
             for (int i = 0; i < toolDefinitions.size(); i++) {
                 JsonObject tool = toolDefinitions.get(i).getAsJsonObject();
-                if ("execute_actions".equals(tool.get("name").getAsString())) batchTool = tool;
-                if ("get_map".equals(tool.get("name").getAsString())) hasMapTool = true;
-                if ("get_piles".equals(tool.get("name").getAsString())) hasPilesTool = true;
-                if ("get_profile_progress".equals(tool.get("name").getAsString())) hasProgressTool = true;
-                if ("get_action_status".equals(tool.get("name").getAsString())) hasActionStatusTool = true;
+                names.add(tool.get("name").getAsString());
+                if ("act".equals(tool.get("name").getAsString())) actTool = tool;
+                require(tool.has("annotations"), "every tool should carry behavior annotations");
             }
-            require(hasMapTool, "full map tool should be discoverable");
-            require(hasPilesTool && hasProgressTool && hasActionStatusTool,
-                "pile, profile, and operation status tools should be discoverable");
-            require(batchTool != null && "object".equals(batchTool.getAsJsonObject("inputSchema")
+            require(names.containsAll(java.util.Arrays.asList("get_state", "act", "get_info",
+                "get_profile_progress", "get_action_status", "start_game", "continue_game", "abandon_run", "save_game")),
+                "all consolidated tools should be discoverable");
+            require(actTool != null && "object".equals(actTool.getAsJsonObject("inputSchema")
                 .getAsJsonObject("properties").getAsJsonObject("actions")
                 .getAsJsonObject("items").get("type").getAsString()),
-                "batch actions should be declared as objects");
+                "act should declare its actions as objects");
+            require(!tools.body.contains("\\u003d") && !tools.body.contains("\\u0027"),
+                "responses should not HTML-escape characters");
 
             JsonArray encodedActions = new JsonParser().parse(
                 "[\"{\\\"action\\\":\\\"play_card\\\",\\\"card_index\\\":1}\",{\"action\":\"end_turn\"}]").getAsJsonArray();
             JsonArray normalizedActions = MCPServer.normalizeBatchActions(encodedActions);
             require(normalizedActions.get(0).isJsonObject() && normalizedActions.get(1).isJsonObject(),
                 "legacy JSON-string actions should be normalized to objects");
+            JsonObject legacy = normalizedActions.get(0).getAsJsonObject();
+            require("play".equals(legacy.get("action").getAsString()) && legacy.get("card").getAsInt() == 1,
+                "legacy action and parameter names should map to the new ones");
             try {
                 MCPServer.normalizeBatchActions(new JsonParser().parse("[42]").getAsJsonArray());
                 throw new AssertionError("non-object actions should be rejected");
             } catch (IllegalArgumentException expected) {
                 require(expected.getMessage().contains("Action 1"), "validation should identify the bad action");
+            }
+            try {
+                MCPServer.normalizeBatchActions(new JsonParser().parse("[{\"action\":\"fly\"}]").getAsJsonArray());
+                throw new AssertionError("unknown actions should be rejected");
+            } catch (IllegalArgumentException expected) {
+                require(expected.getMessage().contains("fly"), "validation should name the unknown action");
             }
 
             Response unknownOperation = request(port, "POST",
@@ -100,41 +108,50 @@ public class MCPServerProtocolTest {
                 .getAsJsonObject("result").get("isError").getAsBoolean(),
                 "unknown operation IDs should return a tool error");
 
-            CompletableFuture<Response> mapCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
-                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get_map\",\"arguments\":{}}}"));
-            CompletableFuture<Response> pilesCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
-                "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"get_piles\",\"arguments\":{}}}"));
+            CompletableFuture<Response> stateCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
+                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"get_state\",\"arguments\":{}}}"));
+            CompletableFuture<Response> infoCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
+                "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"get_info\",\"arguments\":{\"names\":[\"Nonexistent Thing\"]}}}"));
             CompletableFuture<Response> progressCall = CompletableFuture.supplyAsync(() -> requestUnchecked(port,
                 "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"get_profile_progress\",\"arguments\":{}}}"));
             long deadline = System.currentTimeMillis() + 1500;
-            while ((!mapCall.isDone() || !pilesCall.isDone() || !progressCall.isDone()) &&
+            while ((!stateCall.isDone() || !infoCall.isDone() || !progressCall.isDone()) &&
                 System.currentTimeMillis() < deadline) {
                 if (server.hasPendingToolCalls()) server.processPendingToolCalls();
                 Thread.sleep(5);
             }
-            JsonObject mapResponse = new JsonParser().parse(mapCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
-            JsonObject pilesResponse = new JsonParser().parse(pilesCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
+            JsonObject stateResponse = new JsonParser().parse(stateCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
+            JsonObject infoResponse = new JsonParser().parse(infoCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
             JsonObject progressResponse = new JsonParser().parse(progressCall.get(2, TimeUnit.SECONDS).body).getAsJsonObject();
-            require(mapResponse.get("id").getAsInt() == 4 && resultData(mapResponse).has("screen_type"),
-                "map call should receive its own result");
-            require(pilesResponse.get("id").getAsInt() == 5 && resultData(pilesResponse).has("available"),
-                "piles call should receive its own result");
-            require(progressResponse.get("id").getAsInt() == 6 && resultData(progressResponse).has("profile_slot"),
+            require(stateResponse.get("id").getAsInt() == 4 && resultText(stateResponse).startsWith("[MAIN_MENU]"),
+                "state call should receive its own text result");
+            require(infoResponse.get("id").getAsInt() == 5 && resultText(infoResponse).contains("not found"),
+                "info call should receive its own result");
+            require(progressResponse.get("id").getAsInt() == 6 && resultText(progressResponse).startsWith("Profile"),
                 "profile call should receive its own result");
 
-            Map<String, Object> stillInRun = new HashMap<>();
-            stillInRun.put("in_game", true);
-            stillInRun.put("screen_type", "COMBAT_REWARD");
+            mcpthespire.Snapshot stillInRun = new mcpthespire.Snapshot();
+            stillInRun.inGame = true;
+            stillInRun.screen = "COMBAT_REWARD";
             require(!MCPServer.destinationReached("save_game", stillInRun),
                 "save must not settle during an intermediate dungeon screen");
-            Map<String, Object> atMenu = new HashMap<>();
-            atMenu.put("in_game", false);
-            atMenu.put("screen_type", "MAIN_MENU");
-            atMenu.put("save_file_exists", true);
+            mcpthespire.Snapshot atMenu = new mcpthespire.Snapshot();
+            atMenu.inGame = false;
+            atMenu.screen = "MAIN_MENU";
+            atMenu.saveExists = true;
             require(MCPServer.destinationReached("save_game", atMenu),
                 "save should settle when the main menu is reached");
             require(!MCPServer.destinationReached("abandon_run", atMenu),
                 "abandon should wait until the save is gone");
+
+            require("Anger".equals(MCPToolHandler.choiceLabel("[Anger] Cost: 0 ATTACK")) &&
+                "Shrug It Off".equals(MCPToolHandler.choiceLabel("[Shrug It Off] Cost: 1 SKILL (47 gold)")) &&
+                "10 gold".equals(MCPToolHandler.choiceLabel("10(+0 bonus) gold")) &&
+                "Blood Potion".equals(MCPToolHandler.choiceLabel("add potion: [Blood Potion] Heal for 20% of your Max HP.")) &&
+                "Talk".equals(MCPToolHandler.choiceLabel("[Talk]")) &&
+                "[Pray] Remove a card.".equals(MCPToolHandler.choiceLabel("[ Pray ] Remove a card.")) &&
+                "(x=0, y=3) Unknown".equals(MCPToolHandler.choiceLabel("(x=0, y=3) Unknown")),
+                "action log should label choices by name");
 
             require(requestWithOrigin(port, "http://example.com") == 403,
                 "cross-origin requests should be rejected");
@@ -201,10 +218,9 @@ public class MCPServerProtocolTest {
         }
     }
 
-    private static JsonObject resultData(JsonObject response) {
-        String json = response.getAsJsonObject("result").getAsJsonArray("content")
+    private static String resultText(JsonObject response) {
+        return response.getAsJsonObject("result").getAsJsonArray("content")
             .get(0).getAsJsonObject().get("text").getAsString();
-        return new JsonParser().parse(json).getAsJsonObject();
     }
 
     private static int requestWithOrigin(int port, String origin) throws Exception {

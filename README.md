@@ -2,14 +2,16 @@
 
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+> **Personal fork.** This is a personal fork of [ifree/MCPTheSpire](https://github.com/ifree/MCPTheSpire), the original mod and all credit for it. This fork fixes the Streamable HTTP handshake for stricter MCP clients and reworks the tool surface for token efficiency (compact text state, 9 tools; see [bench/RESULTS.md](bench/RESULTS.md)). It is not affiliated with or supported by the original author, so please don't report issues from this fork upstream.
+
 A Slay the Spire mod that enables AI agents to play the game through the Model Context Protocol (MCP). This allows AI assistants like Claude, GPT, or other MCP-compatible clients to interact with and control Slay the Spire gameplay programmatically.
 
 ## Features
 
 - **MCP Protocol Support**: Full implementation of Model Context Protocol using Streamable HTTP transport
 - **Real-time Game Control**: AI agents can play cards, make choices, use potions, and navigate menus
-- **Batch Actions**: Execute multiple actions in a single call for efficient gameplay
-- **Game State Access**: Comprehensive access to player stats, hand, monsters, screen information, and card details on demand
+- **Token-efficient**: Compact text state and per-action change logs instead of JSON snapshots (about 75% less tool output, about 90% less per combat turn)
+- **Batch Actions**: Execute multiple actions in a single call, with indices that stay stable across the batch
 - **Thread-safe Operations**: Read-only operations execute immediately, game-changing actions are queued for safe execution on the game thread
 - **Configurable Server**: Customizable host and port settings
 
@@ -76,375 +78,81 @@ For Claude Desktop, add to your MCP config:
 
 ## MCP Tools Reference
 
-### State Query Tools (Read-only)
+The server exposes 9 tools and returns **compact text** rather than JSON, which keeps token usage low (see [bench/RESULTS.md](bench/RESULTS.md)). General rules are sent once in the `initialize` result's `instructions` field, so they are not repeated in every tool description:
 
-#### `get_game_state`
-Get complete game state with optional filtering.
+- All numbers (hand card, enemy, choice, potion slot) are **1-based** and match the latest state.
+- Within one `act` call, numbers refer to the state **at call time**. They do not shift as cards are played, enemies die, or rewards are taken.
+- `act` returns one line per action describing what changed, followed by the new state, so a follow-up `get_state` is rarely needed.
 
-**Parameters:**
-- `include` (optional): Array of sections to include: `player`, `deck`, `relics`, `potions`, `combat`, `screen`
-- Note: `map` is **excluded by default** (large/static data) - add `"map"` to include array if needed
+| Tool | Purpose |
+|---|---|
+| `get_state` | Current screen as text. Optional `include`: `deck`, `relics`, `piles`, `map` |
+| `act` | Run one or more actions in order |
+| `get_info` | Describe cards (with the upgraded version), relics, potions, or powers active in combat, by name or ID |
+| `get_profile_progress` | Per-character stats and unlocks. Optional `include_cards`, `include_achievements` |
+| `get_action_status` | Result of an action reported as still running (pass its `operation_id`) |
+| `start_game` | `character` (IRONCLAD/SILENT/DEFECT/WATCHER), optional `ascension`, `seed` |
+| `continue_game` / `abandon_run` / `save_game` | Main-menu run management |
 
-**Example:**
-```json
-{"include": ["player", "combat", "map"]}
+Read-only tools carry `readOnlyHint`, and `abandon_run` carries `destructiveHint`, so clients can auto-approve safely.
+
+### State format
+
+```
+[COMBAT] Act 1 Floor 1 | HP 69/80 | Gold 99 | Turn 2 | Energy 3/3
+You: Block 0
+Enemies (incoming 7 damage):
+ 1. Jaw Worm 23/41 | Attack 7 + Defend
+Hand:
+ 1. Strike [1] Deal 6 damage. (target)
+ 2. Defend [1] Gain 5 Block.
+ 3. Bash [2] Deal 8 damage. Apply 2 Vulnerable. (target)
+Piles: draw 1, discard 6, exhaust 0
+Potions: 1. Fire Potion (target), 2. empty, 3. empty
+Actions: play, end_turn, use_potion/discard_potion
 ```
 
-#### `get_map`
-Get the full visible route graph for the current act, including room coordinates/types, connections, the current node, and `choice_index` values for the next reachable nodes. This is the simplest way to plan a path; call it again after moving to a new act.
+- Card text already includes current damage, block, and magic numbers (affected by Strength, Frail, and so on).
+- Card rewards, shop items, boss relics, and events list numbered choices with full text.
+- Large card grids are shown as a single numbered line.
+- On the map screen, the map appears automatically, showing only rooms still reachable: `y3: 0?>0 *1M>1,2` means row 3, column 0 is an event leading to column 0, and you (`*`) are at column 1, a monster room leading to columns 1 and 2.
 
-#### `get_piles`
-Get the cards currently visible in the draw, discard, and exhaust piles during combat. The draw-pile list is deliberately unordered because the game does not show its exact draw order.
+### `act`
 
-#### `get_profile_progress`
-Read character statistics and unlock progress for the active save slot, even at the main menu. The default response includes each character's wins, deaths, playtime, ascension, next unlock bundle, and locked cards, plus locked relics. Set `include_cards: true` for the complete per-character card catalogs or `include_achievements: true` for achievement details. This reports progress without navigating the Statistics screens or finishing a run.
+`{"actions": [...]}`, where each item has an `action` plus parameters:
 
-#### `get_action_status`
-If an action returns `status: "queued"` or `"resolving"`, pass its `operation_id` to this tool for the final result. A pending response does not mean the action failed; do not submit it again blindly.
+| Action | Parameters |
+|---|---|
+| `play` | `card` (hand number, name like `"Strike+"`, or ID), `target?` (enemy number; optional with one enemy) |
+| `end_turn` | |
+| `choose` | `choice` |
+| `proceed` / `confirm` | |
+| `skip` / `cancel` | |
+| `select` | `drop: [cards]` or `keep: [cards]` on hand-selection screens; auto-confirms |
+| `use_potion` | `slot`, `target?` |
+| `discard_potion` | `slot` |
+| `wait` | `ms` (max 500) |
 
-#### `get_screen_state`
-Get lightweight current screen state. **Recommended for most use cases.**
+Example result:
 
-**Returns:**
-- `screen_type`: Current screen (COMBAT_REWARD, CARD_REWARD, MAP, etc.)
-- `room_phase`: Room phase (COMBAT, COMPLETE, etc.)
-- `choice_list`: Available choices
-- `can_proceed` / `can_cancel`: Button availability
-- `hand`, `monsters`, `energy`: Combat info (if in combat)
-- `cards_played_this_turn` and, with Velvet Choker, `card_play_limit` / `card_plays_remaining`
-- `pile_counts`: Draw, discard, and exhaust pile sizes
-- `readiness`: Why the game is ready or still resolving
-- Player powers/block, potion descriptions, card descriptions, and monster attack details (if in combat)
+```
+1. play Anger -> Jaw Worm: Jaw Worm HP 41->35
+2. play Strike -> Jaw Worm: Energy 3->2; Jaw Worm HP 35->29
+3. play Strike -> Jaw Worm: Energy 2->1; Jaw Worm HP 29->23
+4. end_turn: HP 80->69; Energy 1->3
 
-On `HAND_SELECT`, `screen_state.eligible_choices` lists selectable cards, while `screen_state.full_hand_before_selection` preserves the hand before the game filtered those choices. On game-over screens, `screen_name` is normalized to `VICTORY` or `DEFEAT`; `raw_screen_name` preserves the game's internal label.
-
-#### `get_available_commands`
-Get context-aware list of available tools for current screen.
-
-**Returns:**
-```json
-{
-  "screen_type": "COMBAT_REWARD",
-  "available_tools": [
-    {"tool": "choose", "description": "Make a choice from: [gold, card]"},
-    {"tool": "proceed", "description": "Click proceed button"}
-  ]
-}
+[COMBAT] Act 1 Floor 1 | HP 69/80 | Gold 99 | Turn 2 | Energy 3/3
+...
 ```
 
-#### `get_card_info`
-Get detailed card information including description and upgraded version.
+A batch stops early when the screen changes or an enemy's intent changes, and the result says so. A few follow-ups still run on the new screen:
 
-**When to use:** Card objects in game state are optimized for size and don't include descriptions. Use this tool when you need to know what a card does.
+- Index-free buttons (`proceed`, `confirm`, `skip`, `cancel`) when the new screen offers them, for example picking a card reward and then pressing `proceed`.
+- `select` on a hand-selection screen opened by the previous card.
 
-**Parameters:**
-- `card_ids` (required): Array of card IDs to query
+On an error, the result names the failed action, explains why, and lists what is available. It also includes the current state.
 
-**Example:**
-```json
-{"card_ids": ["Strike_R", "Bash", "Defend_R"]}
-```
-
-**Returns:**
-```json
-{
-  "cards": [
-    {
-      "id": "Bash",
-      "name": "Bash",
-      "type": "ATTACK",
-      "rarity": "BASIC",
-      "cost": 2,
-      "description": "Deal !D! damage. Apply !M! Vulnerable.",
-      "base_damage": 8,
-      "base_magic_number": 2,
-      "has_target": true,
-      "upgraded": {
-        "name": "Bash+",
-        "description": "Deal !D! damage. Apply !M! Vulnerable.",
-        "base_damage": 10,
-        "base_magic_number": 3
-      }
-    }
-  ]
-}
-```
-
-### Batch Actions (Recommended)
-
-#### `execute_actions`
-Execute multiple actions in sequence. **This is the most efficient way to play.**
-
-Pass action objects, not JSON strings: `{"actions":[{"action":"play_card","card_index":1,"target_index":1},{"action":"end_turn"}]}`.
-
-Actions wait for the game to be ready (animations complete, state updated) before each execution and before returning. Each action includes compact `before` and `after` states. A batch stops early if the screen or a visible enemy intent changes, so the caller can reconsider the remaining actions.
-
-**Key Feature: Stable Indices** - All `card_index` and `choice_index` values refer to positions **at the time you called the tool**, not after each action executes. You don't need to recalculate indices as cards are played or choices are made.
-
-**Example - Stable card_index:**
-```
-Your hand: [1: Strike, 2: Defend, 3: Bash, 4: Strike, 5: Defend]
-You want to play: Strike(1), Bash(3), Strike(4)
-
-CORRECT - use original positions:
-  card_index: 1, 3, 4
-
-WRONG - don't recalculate after each play:
-  card_index: 1, 2, 2  ← This is incorrect!
-```
-
-**Example - Stable choice_index:**
-```
-Rewards: [1: gold, 2: potion, 3: card, 4: relic]
-You want: gold(1) and card(3)
-
-CORRECT: choice_index: 1, 3
-WRONG:   choice_index: 1, 2  ← Don't recalculate!
-```
-
-**Parameters:**
-- `actions`: Array of action objects
-
-**Supported Actions:**
-
-| Action | Parameters | Description |
-|--------|------------|-------------|
-| `play_card` | `card_index` OR `card_name` OR `card_id`, `target_index?` | Play a card by position, name, or ID |
-| `end_turn` | - | End turn |
-| `choose` | `choice_index` | Make a choice (1-indexed) |
-| `select_cards` | `drop` OR `keep` (array) | Select cards on HAND_SELECT screen |
-| `proceed` | - | Click proceed button |
-| `confirm` | - | Confirm selection (grid/hand select) |
-| `skip` | - | Skip card reward |
-| `cancel` | - | Cancel/return |
-| `use_potion` | `potion_slot`, `target_index?` | Use potion |
-| `discard_potion` | `potion_slot` | Discard potion |
-| `wait` | `ms?` | Wait (max 500ms) |
-
-**Action Parameters Detail:**
-
-`play_card` - Play a card from hand
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `card_index` | integer | One of three | 1-indexed position in hand (stable) |
-| `card_name` | string | One of three | Card display name (e.g., "Strike", "Strike+") |
-| `card_id` | string | One of three | Card internal ID (e.g., "Strike_R") |
-| `target_index` | integer | For targeted | 1-indexed monster target |
-
-`choose` - Make a choice on current screen
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `choice_index` | integer | Yes | 1-indexed choice position (stable) |
-
-`select_cards` - Select cards on HAND_SELECT screen
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `drop` | array | One of two | Cards to select (by index/name/id) |
-| `keep` | array | One of two | Cards to keep (selects all others) |
-
-`use_potion` - Use a potion
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `potion_slot` | integer | Yes | 1-indexed potion slot |
-| `target_index` | integer | For targeted | 1-indexed monster target |
-
-`discard_potion` - Discard a potion
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `potion_slot` | integer | Yes | 1-indexed potion slot |
-
-`wait` - Wait for animations/state
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `ms` | integer | No | Milliseconds to wait (default: 100, max: 500) |
-
-**Example - Play cards by name (recommended):**
-```json
-{
-  "actions": [
-    {"action": "play_card", "card_name": "Defend"},
-    {"action": "play_card", "card_name": "Strike", "target_index": 1},
-    {"action": "play_card", "card_name": "Bash", "target_index": 1},
-    {"action": "end_turn"}
-  ]
-}
-```
-
-**Using card_name is recommended** - it automatically finds the card in your current hand, so you don't need to track index changes.
-
-**Alternative - Play by index (indices are stable):**
-```json
-{
-  "actions": [
-    {"action": "play_card", "card_index": 1},
-    {"action": "play_card", "card_index": 3},
-    {"action": "play_card", "card_index": 5},
-    {"action": "end_turn"}
-  ]
-}
-```
-Indices are **automatically stabilized** - `card_index: 1, 3, 5` plays the cards at those positions **when you called the tool**. No need to account for hand changes as cards are played.
-
-**Example - Take rewards and proceed (indices are stable):**
-```json
-{
-  "actions": [
-    {"action": "choose", "choice_index": 1},
-    {"action": "choose", "choice_index": 2},
-    {"action": "proceed"}
-  ]
-}
-```
-
-**Example - select_cards for HAND_SELECT screen (e.g., after Survivor):**
-```json
-{
-  "actions": [
-    {"action": "play_card", "card_name": "Survivor"},
-    {"action": "select_cards", "drop": ["Strike"]}
-  ]
-}
-```
-
-The `select_cards` action supports two modes:
-- `drop`: Select these cards (to be discarded/affected)
-- `keep`: Keep these cards, select all others
-
-**Note:** `select_cards` automatically confirms after selection. No need for a separate `confirm` action.
-
-Cards can be specified by:
-- **Index**: `[1, 3]` (1-indexed, uses stable initial positions)
-- **Name**: `["Strike", "Defend"]`
-- **ID**: `["Strike_R", "Defend_G"]`
-- **Mixed**: `[1, "Bash", "Defend_R"]`
-
-**Example - Gambler's Chip (keep specific cards, discard rest):**
-```json
-{
-  "actions": [
-    {"action": "select_cards", "keep": ["Bash", "Inflame"]}
-  ]
-}
-```
-Inspect the settled hand before submitting the next play.
-
-**Returns:**
-```json
-{
-  "status": "ready",
-  "settled": true,
-  "actions_requested": 2,
-  "actions_completed": 2,
-  "partial": false,
-  "actions": [
-    {"index": 1, "action": {"action": "play_card", "card_name": "Defend"}, "before": {}, "after": {}},
-    {"index": 2, "action": {"action": "end_turn"}, "before": {}, "after": {}}
-  ],
-  "after": {}
-}
-```
-
-On error, the response has `status: "error"`, `failed_index` (1-indexed), `failed_action`, and `error`. On an expected early stop, `partial: true` and `stop_reason` explain why. A transition lasting more than the request's 20-second wait returns a pending `operation_id`; poll with `get_action_status`.
-
-### Individual Action Tools
-
-These execute single actions. Use `execute_actions` for efficiency when possible.
-
-#### `play_card`
-Play a card from hand. Specify ONE of:
-- `card_name`: Card display name (e.g., "Strike", "Strike+", "Defend")
-- `card_id`: Card internal ID (e.g., "Strike_R", "Defend_G")
-- `card_index`: 1-indexed card position
-
-Optional:
-- `target_index`: 1-indexed monster target (for targeted cards)
-
-**Examples:** `{card_name:'Bash',target_index:1}`, `{card_index:3,target_index:1}`, `{card_name:'Defend'}`
-
-#### `end_turn`
-End your current turn in combat.
-
-#### `choose`
-Make a choice from the current screen.
-- `choice_index` (required): 1-indexed choice position
-
-#### `use_potion`
-Use a potion.
-- `potion_slot` (required): 1-indexed potion slot
-- `target_index` (optional): 1-indexed target
-
-#### `discard_potion`
-Discard a potion.
-- `potion_slot` (required): 1-indexed potion slot
-
-### Navigation Tools
-
-| Tool | Description | Use When |
-|------|-------------|----------|
-| `proceed` | Leave current screen | Combat rewards, rest site, shop room, chest |
-| `confirm` | Confirm selection | Grid select, hand select |
-| `skip` | Skip without selecting | Card reward screen |
-| `cancel` | Go back | Shop screen, map, boss reward |
-
-### Game Management Tools
-
-#### `start_game`
-Start a new game.
-- `character` (required): IRONCLAD, SILENT, DEFECT, or WATCHER
-- `ascension` (optional): 0-20
-- `seed` (optional): Alphanumeric seed
-
-#### `continue_game`
-Continue from save file.
-
-#### `abandon_run`
-Abandon current run.
-
-#### `save_game`
-Return to the main menu. Continue restores the game's latest autosave checkpoint; choices made since that checkpoint may need to be repeated. To preserve rewards from a room, advance to the next room before leaving.
-
-## Screen Types Reference
-
-| Screen Type | Available Actions |
-|-------------|-------------------|
-| `NONE` (Combat) | `play_card`, `end_turn`, `use_potion` |
-| `COMBAT_REWARD` | `choose` (rewards), `proceed` |
-| `CARD_REWARD` | `choose` (cards), `skip` |
-| `MAP` | `choose` (nodes), `cancel` |
-| `REST` | `choose` (rest/smith), `proceed` |
-| `EVENT` | `choose` (options) |
-| `SHOP_SCREEN` | `choose` (items), `cancel` |
-| `SHOP_ROOM` | `choose`, `proceed` |
-| `BOSS_REWARD` | `choose` (relics), `skip` |
-| `GRID` | `choose`, `confirm` |
-| `HAND_SELECT` | `select_cards` (auto-confirms) |
-
-## Data Structures
-
-Game state objects are optimized for minimal size. Fields are only included when meaningful.
-
-### Card Object
-| Field | Always | Description |
-|-------|--------|-------------|
-| `name`, `uuid`, `id`, `type`, `cost` | Yes | Core identity |
-| `upgrades` | If > 0 | Times upgraded |
-| `is_playable` | In combat | Can be played |
-| `has_target` | If true | Requires target |
-| `exhausts` | If true | Exhausts on play |
-| `damage`, `block`, `magic_number` | If > 0 | Current values |
-| `base_damage`, `base_block`, `base_magic_number` | If different | Base values (when modified) |
-
-**Note:** Card descriptions are not included. Use `get_card_info` to query descriptions.
-
-### Monster Object
-| Field | Always | Description |
-|-------|--------|-------------|
-| `id`, `name`, `current_hp`, `max_hp`, `is_gone` | Yes | Core info |
-| `intent` | Yes | Current intent |
-| `move.damage`, `move.hits` | If attacking | Attack details |
-| `block` | If > 0 | Current block |
-| `powers` | If any | Active powers |
-| `half_dead` | If true | Half dead state |
+Older names are still accepted as aliases: `play_card`, `select_cards`, `card_index`, `card_name`, `card_id`, `target_index`, `choice_index`, `potion_slot`.
 
 ## Building from Source
 
@@ -468,7 +176,8 @@ mvn clean package
 
 - **`MCPServer`**: HTTP server with Streamable HTTP transport
 - **`MCPToolHandler`**: Tool definitions and execution
-- **`GameStateConverter`**: Game state serialization
+- **`StateRenderer`**: Compact text rendering of the game state
+- **`Snapshot`**: Before/after capture used for settling and per-action change logs
 - **`CommandExecutor`**: Safe command execution on game thread
 - **Patches**: SpirePatch hooks for game events
 

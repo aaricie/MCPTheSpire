@@ -9,6 +9,9 @@ import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import com.megacrit.cardcrawl.dungeons.AbstractDungeon;
+import com.megacrit.cardcrawl.monsters.AbstractMonster;
+import mcpthespire.Snapshot;
 
 import java.io.*;
 import java.net.InetSocketAddress;
@@ -18,8 +21,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,7 +41,8 @@ public class MCPServer implements Runnable {
 
     private static final Logger logger = LogManager.getLogger(MCPServer.class.getName());
     private static final String SERVER_NAME = "MCPTheSpire";
-    private static final String SERVER_VERSION = "1.0.0";
+    private static final String SERVER_VERSION = "2.0.0";
+    private static final AtomicInteger OPERATION_COUNTER = new AtomicInteger();
 
     private final String host;
     private final int port;
@@ -261,7 +264,7 @@ public class MCPServer implements Runnable {
     }
 
     private String handleInitialize(JsonElement id, JsonObject params) {
-        Map<String, Object> result = MCPProtocol.buildInitializeResult(SERVER_NAME, SERVER_VERSION);
+        Map<String, Object> result = MCPProtocol.buildInitializeResult(SERVER_NAME, SERVER_VERSION, MCPToolHandler.INSTRUCTIONS);
         logger.info("MCP initialized");
         return MCPProtocol.buildResponse(id, result);
     }
@@ -277,7 +280,8 @@ public class MCPServer implements Runnable {
         }
 
         String toolName = params.get("name").getAsString();
-        JsonObject arguments = params.has("arguments") ? params.get("arguments").getAsJsonObject() : new JsonObject();
+        JsonObject arguments = params.has("arguments") && params.get("arguments").isJsonObject()
+            ? params.get("arguments").getAsJsonObject() : new JsonObject();
 
         logger.info("Tool call: " + toolName + " with args: " + arguments);
 
@@ -285,34 +289,17 @@ public class MCPServer implements Runnable {
             return MCPProtocol.buildResponse(id, getActionStatus(arguments));
         }
 
-        // Execute only tools that are explicitly safe on the HTTP thread.
-        // Some read-only tools still access live game/UI state and must run on the game thread.
-        if (toolHandler.isHttpThreadSafeTool(toolName)) {
-            logger.info("Executing HTTP-thread-safe tool directly on HTTP thread: " + toolName);
-            try {
-                Map<String, Object> result;
-                synchronized (toolExecutionLock) {
-                    result = toolHandler.executeTool(toolName, arguments);
-                }
-                return MCPProtocol.buildResponse(id, result);
-            } catch (Exception e) {
-                logger.error("Error executing HTTP-thread-safe tool: " + toolName, e);
-                return MCPProtocol.buildErrorResponse(id, MCPProtocol.ERROR_INTERNAL, e.getMessage());
-            }
-        }
-
-        // Queue the tool call for execution on the game thread
+        // Every other tool touches live game objects, so it runs on the game thread.
         PendingToolCall pending = new PendingToolCall(toolName, arguments);
         operations.put(pending.operationId, pending);
         pendingToolCalls.add(pending);
-        logger.info("Tool call queued for game thread, pending count: " + pendingToolCalls.size());
 
         try {
             Map<String, Object> result = pending.result.get(HTTP_WAIT_MS, TimeUnit.MILLISECONDS);
             logger.info("Tool call completed: " + toolName);
             return MCPProtocol.buildResponse(id, result);
         } catch (TimeoutException e) {
-            return MCPProtocol.buildResponse(id, MCPProtocol.buildToolCallResultJson(pendingStatus(pending)));
+            return MCPProtocol.buildResponse(id, MCPProtocol.buildToolCallResult(pendingStatus(pending), false));
         } catch (ExecutionException e) {
             return MCPProtocol.buildResponse(id, MCPProtocol.buildToolCallResult("Error: " + e.getCause(), true));
         } catch (InterruptedException e) {
@@ -331,20 +318,18 @@ public class MCPServer implements Runnable {
         }
         return pending.result.isDone()
             ? pending.result.getNow(MCPProtocol.buildToolCallResult("Result unavailable", true))
-            : MCPProtocol.buildToolCallResultJson(pendingStatus(pending));
+            : MCPProtocol.buildToolCallResult(pendingStatus(pending), false);
     }
 
-    private Map<String, Object> pendingStatus(PendingToolCall pending) {
-        Map<String, Object> status = new HashMap<>();
-        status.put("operation_id", pending.operationId);
-        status.put("status", pending.started ? "resolving" : "queued");
-        status.put("settled", false);
-        status.put("tool", pending.toolName);
+    private String pendingStatus(PendingToolCall pending) {
+        StringBuilder s = new StringBuilder("Still ").append(pending.started ? "resolving" : "queued")
+            .append(": ").append(pending.toolName);
         if (pending == activeCall && pendingBatch != null) {
-            status.put("actions_completed", pendingBatch.successCount);
-            status.put("actions_requested", pendingBatch.actions.size());
+            s.append(" (").append(pendingBatch.successCount).append('/').append(pendingBatch.actions.size())
+                .append(" actions done)");
         }
-        return status;
+        return s.append(". Poll get_action_status with operation_id \"").append(pending.operationId)
+            .append("\"; do not resend.").toString();
     }
 
     private void completeCall(PendingToolCall pending, Map<String, Object> result) {
@@ -393,12 +378,12 @@ public class MCPServer implements Runnable {
         activeCall = pending;
         logger.info("Game thread processing tool: " + pending.toolName);
         try {
-            if ("execute_actions".equals(pending.toolName)) {
+            if (MCPToolHandler.ACT.equals(pending.toolName)) {
                 startBatchExecution(pending.arguments);
                 return;
             }
             if (!toolHandler.isReadOnlyTool(pending.toolName)) {
-                pending.before = mcpthespire.GameStateConverter.getActionSummary();
+                pending.before = Snapshot.capture();
             }
             Map<String, Object> result;
             synchronized (toolExecutionLock) {
@@ -407,13 +392,19 @@ public class MCPServer implements Runnable {
             if (toolHandler.isReadOnlyTool(pending.toolName) || Boolean.TRUE.equals(result.get("isError"))) {
                 completeCall(pending, result);
             } else {
-                pending.acknowledgement = result;
+                pending.acknowledgement = resultText(result);
                 markDispatched(pending, 0);
             }
         } catch (Exception e) {
             logger.error("Error executing tool: " + pending.toolName, e);
             completeCall(pending, MCPProtocol.buildToolCallResult("Error: " + e.getMessage(), true));
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String resultText(Map<String, Object> result) {
+        List<Map<String, Object>> content = (List<Map<String, Object>>) result.get("content");
+        return content == null || content.isEmpty() ? "" : String.valueOf(content.get(0).get("text"));
     }
 
     /**
@@ -461,7 +452,7 @@ public class MCPServer implements Runnable {
                 !action.get("action").getAsJsonPrimitive().isString()) {
                 throw new IllegalArgumentException("Action " + (i + 1) + " needs a string 'action' field");
             }
-            normalized.add(action);
+            normalized.add(MCPToolHandler.normalizeAction(action, i + 1));
         }
         return normalized;
     }
@@ -487,82 +478,17 @@ public class MCPServer implements Runnable {
             JsonObject action = pendingBatch.getCurrentAction();
             actionType = action.get("action").getAsString();
             logger.info("Batch executing action " + (pendingBatch.currentIndex + 1) + "/" + pendingBatch.actions.size() + ": " + actionType);
-            pendingBatch.actionBefore = mcpthespire.GameStateConverter.getActionSummary();
+            pendingBatch.actionBefore = Snapshot.capture();
             if ("wait".equals(actionType)) {
                 int waitMs = action.has("ms") ? action.get("ms").getAsInt() : 100;
                 if (waitMs < 0) throw new IllegalArgumentException("wait ms must be nonnegative");
+                pendingBatch.actionDescription = "wait " + Math.min(waitMs, 500) + "ms";
                 markDispatched(activeCall, Math.min(waitMs, 500));
             } else {
-                // For play_card with card_index, convert to card_uuid for stable resolution
-                JsonObject processedAction = action;
-                if ("play_card".equals(actionType) && action.has("card_index") &&
-                    !action.get("card_index").isJsonNull() && pendingBatch.initialHandUuids != null) {
-                    int originalIndex = action.get("card_index").getAsInt();
-                    // Validate index against initial hand size
-                    if (originalIndex < 1 || originalIndex > pendingBatch.initialHandUuids.size()) {
-                        throw new mcpthespire.InvalidCommandException(
-                            "card_index " + originalIndex + " out of bounds. " +
-                            "Initial hand had " + pendingBatch.initialHandUuids.size() + " cards.");
-                    }
-                    java.util.UUID targetUuid = pendingBatch.initialHandUuids.get(originalIndex - 1);
-                    // Create modified action with card_uuid instead of card_index
-                    processedAction = new JsonObject();
-                    for (Map.Entry<String, com.google.gson.JsonElement> entry : action.entrySet()) {
-                        if (!"card_index".equals(entry.getKey())) {
-                            processedAction.add(entry.getKey(), entry.getValue());
-                        }
-                    }
-                    processedAction.addProperty("card_uuid", targetUuid.toString());
-                    logger.info("Converted card_index " + originalIndex + " to card_uuid " + targetUuid);
+                JsonObject resolved = pendingBatch.resolveStableIndices(action);
+                synchronized (toolExecutionLock) {
+                    pendingBatch.actionDescription = toolHandler.executeAction(actionType, resolved);
                 }
-                // For choose with choice_index, resolve stable index by finding the original choice in current list
-                if ("choose".equals(actionType) && processedAction.has("choice_index") &&
-                    !processedAction.get("choice_index").isJsonNull() && pendingBatch.initialChoiceList != null) {
-                    int originalIndex = processedAction.get("choice_index").getAsInt();
-                    // Validate index against initial choice list size
-                    if (originalIndex < 1 || originalIndex > pendingBatch.initialChoiceList.size()) {
-                        throw new mcpthespire.InvalidCommandException(
-                            "choice_index " + originalIndex + " out of bounds. " +
-                            "Initial choices had " + pendingBatch.initialChoiceList.size() + " items: " +
-                            pendingBatch.initialChoiceList);
-                    }
-                    String choiceName = pendingBatch.initialChoiceList.get(originalIndex - 1);
-
-                    // Find this choice in the current list to get the updated index
-                    java.util.ArrayList<String> currentChoices = mcpthespire.ChoiceScreenUtils.getCurrentChoiceList();
-                    int newIndex = -1;
-                    for (int i = 0; i < currentChoices.size(); i++) {
-                        if (currentChoices.get(i).equals(choiceName)) {
-                            newIndex = i + 1;  // 1-indexed
-                            break;
-                        }
-                    }
-
-                    if (newIndex == -1) {
-                        throw new mcpthespire.InvalidCommandException(
-                            "Choice no longer available: " + choiceName +
-                            ". Current choices: " + currentChoices);
-                    }
-
-                    // Update choice_index to the new resolved index
-                    JsonObject chooseAction = new JsonObject();
-                    for (Map.Entry<String, com.google.gson.JsonElement> entry : processedAction.entrySet()) {
-                        if (!"choice_index".equals(entry.getKey())) {
-                            chooseAction.add(entry.getKey(), entry.getValue());
-                        }
-                    }
-                    chooseAction.addProperty("choice_index", newIndex);
-                    processedAction = chooseAction;
-                    logger.info("Resolved choice_index " + originalIndex + " -> " + newIndex + " (choice: " + choiceName + ")");
-                }
-
-                // For select_cards with indices in drop/keep, convert to UUIDs for stable resolution
-                if ("select_cards".equals(actionType) && pendingBatch.initialHandUuids != null) {
-                    processedAction = convertSelectCardsIndices(processedAction, pendingBatch.initialHandUuids);
-                }
-
-                // Execute the single action
-                toolHandler.executeSingleBatchAction(actionType, processedAction);
                 markDispatched(activeCall, 0);
             }
             lastBatchActionTime = System.currentTimeMillis();
@@ -588,12 +514,11 @@ public class MCPServer implements Runnable {
         if (now - call.dispatchedAt > MAX_SETTLE_MS) {
             if (pendingBatch != null) {
                 pendingBatch.markError(pendingBatch.getCurrentAction().get("action").getAsString(),
-                    "Timed out waiting for a command-ready state after this action; do not replay it blindly");
+                    "timed out waiting for the game to settle after this action; check the state before replaying it");
                 finishBatchExecution();
             } else {
-                Map<String, Object> response = settledResponse(call, safeActionSummary(), false);
-                response.put("error", "Timed out waiting for a command-ready state; do not replay this action blindly");
-                completeCall(call, MCPProtocol.buildToolCallResultJson(response, true));
+                completeCall(call, MCPProtocol.buildToolCallResult(call.acknowledgement +
+                    "\nWarning: timed out waiting for the game to settle; do not replay blindly.\n" + renderState(), true));
             }
             return;
         }
@@ -604,89 +529,61 @@ public class MCPServer implements Runnable {
         call.readyFrames = ready ? call.readyFrames + 1 : 0;
         if (call.readyFrames < 2) return;
 
-        Map<String, Object> after = safeActionSummary();
-        Map<String, Object> before = pendingBatch == null ? call.before : pendingBatch.actionBefore;
+        Snapshot after = safeSnapshot();
+        Snapshot before = pendingBatch == null ? call.before : pendingBatch.actionBefore;
         boolean isWait = pendingBatch != null &&
             "wait".equals(pendingBatch.getCurrentAction().get("action").getAsString());
-        if (!isWait && (!call.observedBusy && Objects.equals(before, after) ||
+        if (!isWait && (!call.observedBusy && after.sameAs(before) ||
             !destinationReached(call.toolName, after))) return;
         call.awaitingSettle = false;
         if (pendingBatch != null) {
-            Map<String, Object> actionResult = new HashMap<>();
-            actionResult.put("index", pendingBatch.currentIndex + 1);
-            actionResult.put("action", pendingBatch.getCurrentAction());
-            actionResult.put("before", pendingBatch.actionBefore);
-            actionResult.put("after", after);
-            pendingBatch.actionResults.add(actionResult);
-            boolean intentChanged = enemyIntentChanged(pendingBatch.actionBefore, after);
+            String actionType = pendingBatch.getCurrentAction().get("action").getAsString();
+            pendingBatch.log.append(pendingBatch.currentIndex + 1).append(". ")
+                .append(pendingBatch.actionDescription).append(": ")
+                .append(before == null ? "done" : Snapshot.diff(before, after)).append('\n');
+            boolean intentChanged = before != null && !"end_turn".equals(actionType) &&
+                Snapshot.intentChanged(before, after);
             pendingBatch.markSuccess();
             pendingBatch.checkScreenChange();
             if (intentChanged && pendingBatch.hasMoreActions()) {
-                pendingBatch.stopReason = "enemy_intent_changed";
+                pendingBatch.stopReason = "an enemy intent changed";
             }
             if (!pendingBatch.hasMoreActions() || pendingBatch.stopReason != null) finishBatchExecution();
         } else {
-            completeCall(call, MCPProtocol.buildToolCallResultJson(settledResponse(call, after, true)));
+            completeCall(call, MCPProtocol.buildToolCallResult(call.acknowledgement + "\n" + renderState(), false));
         }
     }
 
-    private Map<String, Object> safeActionSummary() {
+    private Snapshot safeSnapshot() {
         try {
-            return mcpthespire.GameStateConverter.getActionSummary();
+            return Snapshot.capture();
         } catch (Exception e) {
-            Map<String, Object> state = new HashMap<>();
-            state.put("readiness", mcpthespire.GameStateListener.getReadinessReason());
-            state.put("state_error", e.getMessage());
-            return state;
+            Snapshot s = new Snapshot();
+            s.readiness = "state_error: " + e.getMessage();
+            return s;
         }
     }
 
-    static boolean destinationReached(String tool, Map<String, Object> state) {
+    private String renderState() {
+        try {
+            return mcpthespire.StateRenderer.render(java.util.Collections.<String>emptySet());
+        } catch (Exception e) {
+            logger.error("Error rendering state", e);
+            return "(state unavailable: " + e.getMessage() + "; call get_state)";
+        }
+    }
+
+    static boolean destinationReached(String tool, Snapshot state) {
         if ("start_game".equals(tool) || "continue_game".equals(tool)) {
-            return Boolean.TRUE.equals(state.get("in_game"));
+            return state.inGame;
         }
         if ("save_game".equals(tool)) {
-            return Boolean.FALSE.equals(state.get("in_game")) &&
-                "MAIN_MENU".equals(state.get("screen_type"));
+            return !state.inGame && state.screen.startsWith("MAIN_MENU");
         }
         if ("abandon_run".equals(tool)) {
-            return Boolean.FALSE.equals(state.get("in_game")) &&
-                Boolean.FALSE.equals(state.get("save_file_exists"));
+            return !state.inGame && !state.saveExists;
         }
         return true;
-    }
-
-    private Map<String, Object> settledResponse(PendingToolCall call, Map<String, Object> after, boolean settled) {
-        Map<String, Object> response = new HashMap<>();
-        response.put("operation_id", call.operationId);
-        response.put("status", settled ? "ready" : "unsettled");
-        response.put("settled", settled);
-        response.put("before", call.before);
-        response.put("after", after);
-        response.put("acknowledgement", call.acknowledgement);
-        return response;
-    }
-
-    @SuppressWarnings("unchecked")
-    private boolean enemyIntentChanged(Map<String, Object> before, Map<String, Object> after) {
-        Object oldMonsters = before.get("monsters");
-        Object newMonsters = after.get("monsters");
-        if (!(oldMonsters instanceof List) || !(newMonsters instanceof List)) return false;
-        Map<String, Object> oldIntents = new HashMap<>();
-        for (Object value : (List<?>) oldMonsters) {
-            Map<String, Object> monster = (Map<String, Object>) value;
-            oldIntents.put(monster.get("id").toString(), intentSignature(monster));
-        }
-        for (Object value : (List<?>) newMonsters) {
-            Map<String, Object> monster = (Map<String, Object>) value;
-            String id = monster.get("id").toString();
-            if (oldIntents.containsKey(id) && !Objects.equals(oldIntents.get(id), intentSignature(monster))) return true;
-        }
-        return false;
-    }
-
-    private String intentSignature(Map<String, Object> monster) {
-        return String.valueOf(monster.get("intent")) + ":" + String.valueOf(monster.get("move"));
     }
 
     /**
@@ -694,67 +591,22 @@ public class MCPServer implements Runnable {
      */
     private void finishBatchExecution() {
         if (pendingBatch == null) return;
-        Map<String, Object> response = new HashMap<>();
-        response.put("operation_id", activeCall.operationId);
-        response.put("status", pendingBatch.errorMessage == null ? "ready" : "error");
-        response.put("settled", pendingBatch.errorMessage == null);
-        response.put("actions_requested", pendingBatch.actions.size());
-        response.put("actions_completed", pendingBatch.successCount);
-        response.put("actions", pendingBatch.actionResults);
-        response.put("partial", pendingBatch.successCount < pendingBatch.actions.size());
-        if (pendingBatch.screenChanged && pendingBatch.successCount < pendingBatch.actions.size()) {
-            response.put("stop_reason", "screen_changed");
+        PendingBatchExecution batch = pendingBatch;
+        int total = batch.actions.size();
+        StringBuilder text = new StringBuilder();
+        if (batch.errorMessage != null) {
+            text.append("Action ").append(batch.failedIndex + 1).append(" (").append(batch.failedAction)
+                .append(") failed: ").append(batch.errorMessage).append('\n');
+            if (batch.successCount > 0) text.append("Applied before the failure:\n");
+        } else if (batch.successCount < total) {
+            String reason = batch.stopReason != null ? batch.stopReason : "the screen changed";
+            text.append("Stopped after ").append(batch.successCount).append('/').append(total).append(": ")
+                .append(reason).append("; remaining actions were not run.\n");
         }
-        if (pendingBatch.stopReason != null) response.put("stop_reason", pendingBatch.stopReason);
-        if (pendingBatch.errorMessage != null) {
-            response.put("failed_index", pendingBatch.failedIndex + 1);
-            response.put("failed_action", pendingBatch.failedAction);
-            response.put("error", pendingBatch.errorMessage);
-        }
-        response.put("after", safeActionSummary());
-        logger.info("Batch execution finished: " + pendingBatch.successCount + "/" + pendingBatch.actions.size());
-        completeCall(activeCall, MCPProtocol.buildToolCallResultJson(response, pendingBatch.errorMessage != null));
+        text.append(batch.log).append('\n').append(renderState());
+        logger.info("Batch execution finished: " + batch.successCount + "/" + total);
         pendingBatch = null;
-    }
-
-    /**
-     * Convert integer indices in select_cards drop/keep arrays to UUIDs for stable resolution.
-     */
-    private JsonObject convertSelectCardsIndices(JsonObject action, java.util.List<java.util.UUID> initialHandUuids)
-            throws mcpthespire.InvalidCommandException {
-        JsonObject result = new JsonObject();
-
-        for (Map.Entry<String, com.google.gson.JsonElement> entry : action.entrySet()) {
-            String key = entry.getKey();
-            if (("drop".equals(key) || "keep".equals(key)) && entry.getValue().isJsonArray()) {
-                // Convert indices to UUIDs in the array
-                com.google.gson.JsonArray originalArray = entry.getValue().getAsJsonArray();
-                com.google.gson.JsonArray convertedArray = new com.google.gson.JsonArray();
-
-                for (com.google.gson.JsonElement elem : originalArray) {
-                    if (elem.isJsonPrimitive() && elem.getAsJsonPrimitive().isNumber()) {
-                        // This is an index - convert to UUID
-                        int idx = elem.getAsInt();
-                        if (idx < 1 || idx > initialHandUuids.size()) {
-                            throw new mcpthespire.InvalidCommandException(
-                                "Card index " + idx + " out of bounds. Initial hand had " +
-                                initialHandUuids.size() + " cards.");
-                        }
-                        // Convert to UUID string with special prefix so we can identify it later
-                        convertedArray.add("uuid:" + initialHandUuids.get(idx - 1).toString());
-                        logger.info("Converted card index " + idx + " to UUID: " + initialHandUuids.get(idx - 1));
-                    } else {
-                        // Keep strings as-is
-                        convertedArray.add(elem);
-                    }
-                }
-                result.add(key, convertedArray);
-            } else {
-                result.add(key, entry.getValue());
-            }
-        }
-
-        return result;
+        completeCall(activeCall, MCPProtocol.buildToolCallResult(text.toString().trim(), batch.errorMessage != null));
     }
 
     /**
@@ -791,7 +643,7 @@ public class MCPServer implements Runnable {
      * Represents a pending tool call waiting to be executed on the game thread.
      */
     private static class PendingToolCall {
-        final String operationId = UUID.randomUUID().toString();
+        final String operationId = "op" + OPERATION_COUNTER.incrementAndGet();
         final String toolName;
         final JsonObject arguments;
         final long queuedAt = System.currentTimeMillis();
@@ -804,8 +656,8 @@ public class MCPServer implements Runnable {
         long lastObservedFrame;
         int readyFrames;
         boolean observedBusy;
-        Map<String, Object> before;
-        Map<String, Object> acknowledgement;
+        Snapshot before;
+        String acknowledgement = "";
 
         PendingToolCall(String toolName, JsonObject arguments) {
             this.toolName = toolName;
@@ -815,47 +667,40 @@ public class MCPServer implements Runnable {
 
     /**
      * Represents a pending batch execution that spans multiple frames.
+     *
+     * Card, target, and choice numbers refer to the state when the batch started; they are
+     * translated to the live state before each action runs.
      */
     private static class PendingBatchExecution {
         final com.google.gson.JsonArray actions;
         int currentIndex;
         int successCount;
-        int failedIndex;
+        int failedIndex = -1;
         String failedAction;
         String errorMessage;
         boolean screenChanged;
         String stopReason;
-        Map<String, Object> actionBefore;
-        final List<Map<String, Object>> actionResults = new ArrayList<>();
+        Snapshot actionBefore;
+        String actionDescription;
+        final StringBuilder log = new StringBuilder();
         mcpthespire.ChoiceScreenUtils.ChoiceType initialScreen;
-        boolean initialInDungeon;
-        // Initial hand UUIDs for stable card_index resolution
-        java.util.List<java.util.UUID> initialHandUuids;
-        // Initial choice list for stable choice_index resolution
-        java.util.List<String> initialChoiceList;
+        final boolean initialInDungeon;
+        final List<java.util.UUID> initialHandUuids = new ArrayList<>();
+        final List<String> initialChoiceList = new ArrayList<>();
+        final List<AbstractMonster> initialMonsters = new ArrayList<>();
 
         PendingBatchExecution(com.google.gson.JsonArray actions) {
             this.actions = actions;
-            this.currentIndex = 0;
-            this.successCount = 0;
-            this.failedIndex = -1;
-            this.failedAction = null;
-            this.errorMessage = null;
-            this.screenChanged = false;
             this.initialInDungeon = mcpthespire.CommandExecutor.isInDungeon();
             if (this.initialInDungeon) {
                 this.initialScreen = mcpthespire.ChoiceScreenUtils.getCurrentChoiceType();
-                // Capture initial hand state for stable index resolution
-                this.initialHandUuids = new java.util.ArrayList<>();
-                if (com.megacrit.cardcrawl.dungeons.AbstractDungeon.player != null) {
-                    for (com.megacrit.cardcrawl.cards.AbstractCard card :
-                         com.megacrit.cardcrawl.dungeons.AbstractDungeon.player.hand.group) {
-                        this.initialHandUuids.add(card.uuid);
+                if (AbstractDungeon.player != null) {
+                    for (com.megacrit.cardcrawl.cards.AbstractCard card : AbstractDungeon.player.hand.group) {
+                        initialHandUuids.add(card.uuid);
                     }
                 }
-                // Capture initial choice list for stable index resolution
-                this.initialChoiceList = new java.util.ArrayList<>(
-                    mcpthespire.ChoiceScreenUtils.getCurrentChoiceList());
+                initialChoiceList.addAll(mcpthespire.ChoiceScreenUtils.getCurrentChoiceList());
+                initialMonsters.addAll(mcpthespire.StateRenderer.aliveMonsters());
             }
         }
 
@@ -879,15 +724,99 @@ public class MCPServer implements Runnable {
         }
 
         void checkScreenChange() {
-            if (initialInDungeon && mcpthespire.CommandExecutor.isInDungeon()) {
+            boolean inDungeon = mcpthespire.CommandExecutor.isInDungeon();
+            if (initialInDungeon && inDungeon) {
                 mcpthespire.ChoiceScreenUtils.ChoiceType currentScreen = mcpthespire.ChoiceScreenUtils.getCurrentChoiceType();
-                if (initialScreen != currentScreen) {
-                    boolean nextIsHandSelection = currentIndex < actions.size() &&
-                        currentScreen == mcpthespire.ChoiceScreenUtils.ChoiceType.HAND_SELECT &&
-                        "select_cards".equals(actions.get(currentIndex).getAsJsonObject().get("action").getAsString());
-                    screenChanged = !nextIsHandSelection;
+                if (initialScreen != currentScreen && currentIndex < actions.size()) {
+                    String next = actions.get(currentIndex).getAsJsonObject().get("action").getAsString();
+                    boolean nextIsHandSelection = currentScreen == mcpthespire.ChoiceScreenUtils.ChoiceType.HAND_SELECT &&
+                        "select".equals(next);
+                    screenChanged = !nextIsHandSelection && !navigationAvailable(next);
+                    if (!screenChanged) {
+                        // Choices captured at call time no longer describe this screen.
+                        initialScreen = currentScreen;
+                        initialChoiceList.clear();
+                        initialChoiceList.addAll(mcpthespire.ChoiceScreenUtils.getCurrentChoiceList());
+                    }
+                }
+            } else if (initialInDungeon != inDungeon) {
+                screenChanged = true;
+            }
+        }
+
+        /** Index-free buttons are safe to press on a new screen when that screen offers them. */
+        private static boolean navigationAvailable(String action) {
+            switch (action) {
+                case "proceed":
+                case "confirm":
+                    return mcpthespire.CommandExecutor.isConfirmCommandAvailable();
+                case "skip":
+                case "cancel":
+                    return mcpthespire.CommandExecutor.isCancelCommandAvailable();
+                default:
+                    return false;
+            }
+        }
+
+        /** Translate call-time card/target/choice numbers into the live state's numbers. */
+        JsonObject resolveStableIndices(JsonObject action) throws mcpthespire.InvalidCommandException {
+            JsonObject resolved = new JsonObject();
+            for (Map.Entry<String, JsonElement> entry : action.entrySet()) resolved.add(entry.getKey(), entry.getValue());
+            String type = action.get("action").getAsString();
+            if (resolved.has("card") && isNumber(resolved.get("card"))) {
+                resolved.addProperty("card", stableCard(resolved.get("card").getAsInt()));
+            }
+            for (String key : new String[]{"drop", "keep"}) {
+                if (resolved.has(key) && resolved.get(key).isJsonArray()) {
+                    com.google.gson.JsonArray converted = new com.google.gson.JsonArray();
+                    for (JsonElement e : resolved.getAsJsonArray(key)) {
+                        if (isNumber(e)) converted.add(stableCard(e.getAsInt()));
+                        else converted.add(e);
+                    }
+                    resolved.add(key, converted);
                 }
             }
+            if (resolved.has("target") && isNumber(resolved.get("target")) && !initialMonsters.isEmpty()) {
+                int target = resolved.get("target").getAsInt();
+                if (target < 1 || target > initialMonsters.size()) {
+                    throw new mcpthespire.InvalidCommandException(
+                        "target " + target + " out of range 1-" + initialMonsters.size());
+                }
+                AbstractMonster monster = initialMonsters.get(target - 1);
+                int live = mcpthespire.StateRenderer.aliveMonsters().indexOf(monster);
+                if (live < 0) {
+                    throw new mcpthespire.InvalidCommandException(monster.name + " (target " + target + ") is already dead");
+                }
+                resolved.addProperty("target", live + 1);
+            }
+            if ("choose".equals(type) && resolved.has("choice") && isNumber(resolved.get("choice")) &&
+                !initialChoiceList.isEmpty() && mcpthespire.CommandExecutor.isInDungeon() &&
+                mcpthespire.ChoiceScreenUtils.getCurrentChoiceType() == initialScreen) {
+                int original = resolved.get("choice").getAsInt();
+                if (original < 1 || original > initialChoiceList.size()) {
+                    throw new mcpthespire.InvalidCommandException(
+                        "choice " + original + " out of range 1-" + initialChoiceList.size());
+                }
+                String name = initialChoiceList.get(original - 1);
+                int live = mcpthespire.ChoiceScreenUtils.getCurrentChoiceList().indexOf(name);
+                if (live < 0) {
+                    throw new mcpthespire.InvalidCommandException("choice " + original + " (" + name + ") is no longer available");
+                }
+                resolved.addProperty("choice", live + 1);
+            }
+            return resolved;
+        }
+
+        private String stableCard(int index) throws mcpthespire.InvalidCommandException {
+            if (index < 1 || index > initialHandUuids.size()) {
+                throw new mcpthespire.InvalidCommandException(
+                    "card " + index + " out of range 1-" + initialHandUuids.size());
+            }
+            return "uuid:" + initialHandUuids.get(index - 1);
+        }
+
+        private static boolean isNumber(JsonElement e) {
+            return e != null && e.isJsonPrimitive() && e.getAsJsonPrimitive().isNumber();
         }
     }
 }

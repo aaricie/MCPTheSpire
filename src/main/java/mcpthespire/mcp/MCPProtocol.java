@@ -8,6 +8,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonParser;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.ArrayList;
 import java.util.List;
@@ -34,7 +35,7 @@ public class MCPProtocol {
     public static final int ERROR_INVALID_PARAMS = -32602;
     public static final int ERROR_INTERNAL = -32603;
 
-    private static final Gson gson = new GsonBuilder().create();
+    private static final Gson gson = new GsonBuilder().disableHtmlEscaping().create();
 
     private static final JsonParser jsonParser = new JsonParser();
 
@@ -96,9 +97,10 @@ public class MCPProtocol {
     /**
      * Build the initialize response.
      */
-    public static Map<String, Object> buildInitializeResult(String serverName, String serverVersion) {
+    public static Map<String, Object> buildInitializeResult(String serverName, String serverVersion, String instructions) {
         Map<String, Object> result = new HashMap<>();
         result.put("protocolVersion", MCP_VERSION);
+        if (instructions != null) result.put("instructions", instructions);
 
         Map<String, Object> capabilities = new HashMap<>();
         Map<String, Object> tools = new HashMap<>();
@@ -143,32 +145,10 @@ public class MCPProtocol {
     }
 
     /**
-     * Build a tool call result with JSON data.
-     */
-    public static Map<String, Object> buildToolCallResultJson(Object data) {
-        return buildToolCallResultJson(data, false);
-    }
-
-    public static Map<String, Object> buildToolCallResultJson(Object data, boolean isError) {
-        Map<String, Object> result = new HashMap<>();
-
-        List<Map<String, Object>> content = new ArrayList<>();
-        Map<String, Object> textContent = new HashMap<>();
-        textContent.put("type", "text");
-        textContent.put("text", gson.toJson(data));
-        content.add(textContent);
-
-        result.put("content", content);
-        if (isError) result.put("isError", true);
-
-        return result;
-    }
-
-    /**
      * Helper to create a tool definition.
      */
     public static Map<String, Object> createToolDefinition(String name, String description, Map<String, Object> inputSchema) {
-        Map<String, Object> tool = new HashMap<>();
+        Map<String, Object> tool = new LinkedHashMap<>();
         tool.put("name", name);
         tool.put("description", description);
         tool.put("inputSchema", inputSchema);
@@ -176,10 +156,25 @@ public class MCPProtocol {
     }
 
     /**
+     * Tool definition with behavior hints. Clients use these (not the model) to decide on
+     * auto-approval, so they cost the model nothing.
+     */
+    public static Map<String, Object> createToolDefinition(String name, String description, Map<String, Object> inputSchema,
+                                                           boolean readOnly, boolean destructive) {
+        Map<String, Object> tool = createToolDefinition(name, description, inputSchema);
+        Map<String, Object> annotations = new LinkedHashMap<>();
+        annotations.put("readOnlyHint", readOnly);
+        if (!readOnly) annotations.put("destructiveHint", destructive);
+        annotations.put("openWorldHint", false);
+        tool.put("annotations", annotations);
+        return tool;
+    }
+
+    /**
      * Helper to create an input schema.
      */
     public static Map<String, Object> createInputSchema(Map<String, Object> properties, List<String> required) {
-        Map<String, Object> schema = new HashMap<>();
+        Map<String, Object> schema = new LinkedHashMap<>();
         schema.put("type", "object");
         schema.put("properties", properties);
         if (required != null && !required.isEmpty()) {
@@ -192,9 +187,9 @@ public class MCPProtocol {
      * Helper to create a property definition.
      */
     public static Map<String, Object> createProperty(String type, String description) {
-        Map<String, Object> prop = new HashMap<>();
+        Map<String, Object> prop = new LinkedHashMap<>();
         prop.put("type", type);
-        prop.put("description", description);
+        if (description != null) prop.put("description", description);
         return prop;
     }
 
@@ -202,9 +197,9 @@ public class MCPProtocol {
      * Helper to create an enum property definition.
      */
     public static Map<String, Object> createEnumProperty(String description, List<String> values) {
-        Map<String, Object> prop = new HashMap<>();
+        Map<String, Object> prop = new LinkedHashMap<>();
         prop.put("type", "string");
-        prop.put("description", description);
+        if (description != null) prop.put("description", description);
         prop.put("enum", values);
         return prop;
     }

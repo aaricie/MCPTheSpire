@@ -15,180 +15,143 @@ import com.megacrit.cardcrawl.unlock.UnlockTracker;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 
+/** Renders the active profile's statistics and unlock progress as compact text. */
 public final class ProfileStateConverter {
     private ProfileStateConverter() {
     }
 
-    public static HashMap<String, Object> getProfileProgress(boolean includeCards, boolean includeAchievements) {
-        HashMap<String, Object> result = new HashMap<>();
-        result.put("profile_slot", CardCrawlGame.saveSlot);
-        result.put("profile_name", CardCrawlGame.playerName);
-        result.put("in_game", CommandExecutor.isInDungeon());
-        if (CardCrawlGame.characterManager == null || UnlockTracker.unlockProgress == null ||
-            CardLibrary.cards == null) {
-            result.put("available", false);
-            return result;
+    public static String getProfileProgress(boolean includeCards, boolean includeAchievements) {
+        StringBuilder out = new StringBuilder();
+        out.append("Profile ").append(CardCrawlGame.playerName).append(" (slot ").append(CardCrawlGame.saveSlot).append(')');
+        if (CardCrawlGame.characterManager == null || UnlockTracker.unlockProgress == null || CardLibrary.cards == null) {
+            return out.append(": progress not loaded yet").toString();
+        }
+        out.append(", ").append(Math.round(UnlockTracker.getCompletionPercentage())).append("% complete\n");
+        if (UnlockTracker.lockedCharacters != null && !UnlockTracker.lockedCharacters.isEmpty()) {
+            out.append("Locked characters: ").append(String.join(", ", UnlockTracker.lockedCharacters)).append('\n');
         }
 
-        result.put("available", true);
-        result.put("completion_percentage", UnlockTracker.getCompletionPercentage());
-        if (UnlockTracker.lockedCharacters != null) {
-            result.put("locked_characters", new ArrayList<>(UnlockTracker.lockedCharacters));
-        }
-        ArrayList<Object> characters = new ArrayList<>();
-        int totalWins = 0;
-        int totalLosses = 0;
-        long totalPlaytime = 0;
+        int wins = 0, deaths = 0;
+        long playtime = 0;
+        StringBuilder characters = new StringBuilder();
         for (AbstractPlayer player : CardCrawlGame.characterManager.getAllCharacters()) {
-            HashMap<String, Object> character = getCharacterProgress(player, includeCards);
-            characters.add(character);
-            HashMap<String, Object> stats = (HashMap<String, Object>) character.get("stats");
-            totalWins += (Integer) stats.get("victories");
-            totalLosses += (Integer) stats.get("deaths");
-            totalPlaytime += (Long) stats.get("playtime_seconds");
+            CharStat stat = player.getCharStat();
+            if (stat != null) {
+                wins += stat.getVictoryCount();
+                deaths += stat.getDeathCount();
+                playtime += stat.playTime;
+            }
+            renderCharacter(characters, player, stat, includeCards);
         }
-        result.put("characters", characters);
+        out.append("Overall: ").append(wins).append(" wins, ").append(deaths).append(" deaths, ")
+            .append(hours(playtime)).append(" played\n").append(characters);
 
-        HashMap<String, Object> overall = new HashMap<>();
-        overall.put("victories", totalWins);
-        overall.put("deaths", totalLosses);
-        overall.put("playtime_seconds", totalPlaytime);
-        result.put("overall", overall);
-
-        ArrayList<Object> lockedRelics = new ArrayList<>();
+        List<String> lockedRelics = new ArrayList<>();
         if (UnlockTracker.lockedRelics != null) {
             for (String id : UnlockTracker.lockedRelics) {
-                HashMap<String, Object> relic = new HashMap<>();
-                relic.put("id", id);
-                AbstractRelic definition = RelicLibrary.getRelic(id);
-                relic.put("name", definition == null ? id : definition.name);
-                lockedRelics.add(relic);
+                AbstractRelic relic = RelicLibrary.getRelic(id);
+                lockedRelics.add(relic == null ? id : relic.name);
             }
         }
-        result.put("locked_relics", lockedRelics);
-        result.put("locked_relic_count", lockedRelics.size());
-        if (includeAchievements) result.put("achievements", getAchievements());
-        return result;
+        out.append("Locked relics (").append(lockedRelics.size()).append("): ")
+            .append(lockedRelics.isEmpty() ? "none" : String.join(", ", lockedRelics)).append('\n');
+        if (includeAchievements) renderAchievements(out);
+        return out.toString().trim();
     }
 
-    private static HashMap<String, Object> getCharacterProgress(AbstractPlayer player, boolean includeCards) {
-        HashMap<String, Object> result = new HashMap<>();
+    private static void renderCharacter(StringBuilder out, AbstractPlayer player, CharStat stat, boolean includeCards) {
         AbstractPlayer.PlayerClass playerClass = player.chosenClass;
-        result.put("character", playerClass.name());
-        result.put("name", player.getLocalizedCharacterName());
-
-        CharStat stat = player.getCharStat();
-        HashMap<String, Object> stats = new HashMap<>();
+        out.append(playerClass.name()).append(": ");
         if (stat == null) {
-            stats.put("victories", 0);
-            stats.put("deaths", 0);
-            stats.put("playtime_seconds", 0L);
+            out.append("no stats");
         } else {
-            stats.put("victories", stat.getVictoryCount());
-            stats.put("deaths", stat.getDeathCount());
-            stats.put("highest_score", stat.highestScore);
-            stats.put("highest_daily_score", stat.highestDaily);
-            stats.put("highest_ascension", stat.furthestAscent);
-            stats.put("current_win_streak", stat.winStreak);
-            stats.put("best_win_streak", stat.bestWinStreak);
-            stats.put("enemies_killed", stat.enemyKilled);
-            stats.put("bosses_killed", stat.bossKilled);
-            stats.put("playtime_seconds", stat.playTime);
-            stats.put("fastest_victory_seconds", stat.fastestTime);
-            addPrivateStat(stats, stat, "totalFloorsClimbed", "total_floors_climbed");
-            addPrivateStat(stats, stat, "cardsUnlocked", "cards_unlocked_on_stats_page");
-            addPrivateStat(stats, stat, "relicsUnlocked", "relics_unlocked_on_stats_page");
-            addPrivateStat(stats, stat, "cardsDiscovered", "cards_discovered_on_stats_page");
-            addPrivateStat(stats, stat, "cardsToDiscover", "cards_to_discover_on_stats_page");
+            out.append(stat.getVictoryCount()).append("W/").append(stat.getDeathCount()).append("L");
+            int ascension = maxAscension(player);
+            if (ascension > 0) out.append(", ascension unlocked ").append(ascension);
+            out.append(", furthest floor ").append(stat.furthestAscent)
+                .append(", best score ").append(stat.highestScore)
+                .append(", streak ").append(stat.winStreak).append(" (best ").append(stat.bestWinStreak).append(')')
+                .append(", ").append(hours(stat.playTime));
+            if (stat.fastestTime > 0) out.append(", fastest win ").append(minutes(stat.fastestTime));
         }
-        result.put("stats", stats);
+        out.append('\n');
 
         try {
             int level = UnlockTracker.getUnlockLevel(playerClass);
             int progress = UnlockTracker.getCurrentProgress(playerClass);
             int cost = UnlockTracker.getCurrentScoreCost(playerClass);
-            result.put("unlock_level", level);
-            result.put("unlock_progress", progress);
-            result.put("next_unlock_cost", cost);
-            ArrayList<Object> nextBundle = new ArrayList<>();
-            List<AbstractUnlock> bundle = UnlockTracker.getUnlockBundle(playerClass, level);
-            if (bundle != null) {
-                for (AbstractUnlock unlock : bundle) {
-                    HashMap<String, Object> entry = new HashMap<>();
-                    entry.put("type", unlock.type.name());
-                    entry.put("id", unlock.key);
-                    entry.put("name", unlock.title);
-                    nextBundle.add(entry);
-                }
+            List<String> bundle = new ArrayList<>();
+            List<AbstractUnlock> unlocks = UnlockTracker.getUnlockBundle(playerClass, level);
+            if (unlocks != null) {
+                for (AbstractUnlock unlock : unlocks) bundle.add(unlock.title + " (" + unlock.type.name().toLowerCase() + ")");
             }
-            result.put("next_unlocks", nextBundle);
-            result.put("unlock_progress_complete", nextBundle.isEmpty());
-            if (!nextBundle.isEmpty()) {
-                result.put("points_to_next_unlock", Math.max(0, cost - progress));
+            out.append("  Unlock level ").append(level);
+            if (bundle.isEmpty()) {
+                out.append(", all unlocks earned");
+            } else {
+                out.append(", next unlock at ").append(progress).append('/').append(cost).append(" pts: ")
+                    .append(String.join(", ", bundle));
             }
+            out.append('\n');
         } catch (RuntimeException e) {
-            result.put("unlock_progress_available", false);
+            out.append("  Unlock progress unavailable\n");
         }
 
         ArrayList<AbstractCard> cards = new ArrayList<>();
         for (AbstractCard card : CardLibrary.cards.values()) {
-            if (card.color == player.getCardColor() && card.rarity != AbstractCard.CardRarity.SPECIAL) {
-                cards.add(card);
-            }
+            if (card.color == player.getCardColor() && card.rarity != AbstractCard.CardRarity.SPECIAL) cards.add(card);
         }
-        cards.sort(Comparator.comparing((AbstractCard card) -> card.name)
-            .thenComparing(card -> card.cardID));
-        ArrayList<Object> locked = new ArrayList<>();
-        ArrayList<Object> all = new ArrayList<>();
-        int seenCount = 0;
+        cards.sort(Comparator.comparing((AbstractCard card) -> card.name).thenComparing(card -> card.cardID));
+        List<String> locked = new ArrayList<>();
+        List<String> unlocked = new ArrayList<>();
+        int seen = 0;
         for (AbstractCard card : cards) {
-            boolean isLocked = UnlockTracker.isCardLocked(card.cardID);
             boolean isSeen = UnlockTracker.isCardSeen(card.cardID);
-            if (isSeen) seenCount++;
-            HashMap<String, Object> entry = new HashMap<>();
-            entry.put("id", card.cardID);
-            entry.put("name", card.name);
-            entry.put("rarity", card.rarity.name());
-            entry.put("unlocked", !isLocked);
-            entry.put("seen", isSeen);
-            if (isLocked) locked.add(entry);
-            if (includeCards) all.add(entry);
+            if (isSeen) seen++;
+            String label = card.name + (isSeen ? "" : " (unseen)");
+            if (UnlockTracker.isCardLocked(card.cardID)) locked.add(label);
+            else unlocked.add(label);
         }
-        result.put("card_catalog_count", cards.size());
-        result.put("cards_available", cards.size() - locked.size());
-        result.put("cards_locked", locked);
-        result.put("cards_seen", seenCount);
-        if (includeCards) result.put("cards", all);
-        return result;
+        out.append("  Cards: ").append(cards.size() - locked.size()).append('/').append(cards.size())
+            .append(" unlocked, ").append(seen).append(" seen");
+        if (!locked.isEmpty()) out.append(". Locked: ").append(String.join(", ", locked));
+        out.append('\n');
+        if (includeCards) out.append("  Unlocked cards: ").append(String.join(", ", unlocked)).append('\n');
     }
 
-    private static void addPrivateStat(HashMap<String, Object> stats, CharStat stat, String field, String key) {
+    private static int maxAscension(AbstractPlayer player) {
         try {
-            Object value = ReflectionHacks.getPrivate(stat, CharStat.class, field);
-            if (value != null) stats.put(key, value);
-        } catch (RuntimeException ignored) {
-            // Older or modded game versions may not carry every Statistics field.
+            return player.getPrefs().getInteger(CharStat.ASCENSION_LEVEL, 0);
+        } catch (RuntimeException e) {
+            return 0;
         }
     }
 
-    private static ArrayList<Object> getAchievements() {
-        ArrayList<Object> achievements = new ArrayList<>();
-        if (StatsScreen.achievements == null || StatsScreen.achievements.items == null) return achievements;
+    private static void renderAchievements(StringBuilder out) {
+        if (StatsScreen.achievements == null || StatsScreen.achievements.items == null) return;
+        out.append("Achievements:\n");
         for (AchievementItem item : StatsScreen.achievements.items) {
-            HashMap<String, Object> achievement = new HashMap<>();
-            achievement.put("id", item.key);
-            achievement.put("unlocked", UnlockTracker.isAchievementUnlocked(item.key));
+            String name = item.key;
+            String desc = "";
             try {
-                achievement.put("name", ReflectionHacks.getPrivate(item, AchievementItem.class, "title"));
-                achievement.put("description", ReflectionHacks.getPrivate(item, AchievementItem.class, "desc"));
+                name = String.valueOf(ReflectionHacks.getPrivate(item, AchievementItem.class, "title"));
+                desc = String.valueOf(ReflectionHacks.getPrivate(item, AchievementItem.class, "desc"));
             } catch (RuntimeException ignored) {
-                // The ID and unlock state remain useful without localized text.
+                // The key and unlock state remain useful without localized text.
             }
-            achievements.add(achievement);
+            out.append(UnlockTracker.isAchievementUnlocked(item.key) ? " [x] " : " [ ] ").append(name);
+            if (!desc.isEmpty()) out.append(": ").append(desc);
+            out.append('\n');
         }
-        return achievements;
+    }
+
+    private static String hours(long seconds) {
+        return String.format("%.1fh", seconds / 3600.0);
+    }
+
+    private static String minutes(long seconds) {
+        return (seconds / 60) + "m" + (seconds % 60) + "s";
     }
 }

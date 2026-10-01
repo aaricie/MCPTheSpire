@@ -50,13 +50,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $metadataTest = Join-Path $projectRoot 'src\test\java\mcpthespire\patches\PatchParameterMetadataTest.java'
-& $javacCommand.Source --release 8 -proc:none -Xlint:-options -cp "$classesDirectory;$classPath" -d $testClassesDirectory $metadataTest
+$protocolTest = Join-Path $projectRoot 'src\test\java\mcpthespire\mcp\MCPServerProtocolTest.java'
+& $javacCommand.Source --release 8 -proc:none -Xlint:-options -cp "$classesDirectory;$classPath" -d $testClassesDirectory $metadataTest $protocolTest
 if ($LASTEXITCODE -ne 0) {
-    throw "Patch metadata test compilation failed with exit code $LASTEXITCODE."
+    throw "Test compilation failed with exit code $LASTEXITCODE."
 }
 & $java -cp "$testClassesDirectory;$classesDirectory;$classPath" mcpthespire.patches.PatchParameterMetadataTest $classesDirectory
 if ($LASTEXITCODE -ne 0) {
     throw "Patch metadata test failed with exit code $LASTEXITCODE."
+}
+& $java -cp "$testClassesDirectory;$classesDirectory;$classPath" mcpthespire.mcp.MCPServerProtocolTest | Select-String -Pattern 'passed|Error|Exception'
+if ($LASTEXITCODE -ne 0) {
+    throw "MCP protocol test failed with exit code $LASTEXITCODE."
 }
 
 $resourcesDirectory = Join-Path $projectRoot 'src\main\resources'

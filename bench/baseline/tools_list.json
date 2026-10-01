@@ -1,0 +1,372 @@
+[
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "include": {
+     "description": "Sections: player, deck, relics, potions, combat, screen (default=all). 'map' must be explicitly requested.",
+     "type": "array",
+     "items": {
+      "description": "Section name",
+      "type": "string"
+     }
+    }
+   }
+  },
+  "name": "get_game_state",
+  "description": "Get game state. Sections: player, deck, relics, potions, combat, screen (default=all). 'map' excluded by default (large/static) - request explicitly when needed."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "get_map",
+  "description": "Get the full visible act map with room coordinates, directed paths, current position, and 1-indexed next route choices. Use before choosing a path."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "get_piles",
+  "description": "Get visible combat pile contents. Draw-pile cards are unordered because their exact draw order is hidden in the game."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "include_cards": {
+     "description": "Include every card in each character's catalog, not just locked cards",
+     "type": "boolean"
+    },
+    "include_achievements": {
+     "description": "Include achievement names and unlock states",
+     "type": "boolean"
+    }
+   }
+  },
+  "name": "get_profile_progress",
+  "description": "Read the active profile's character statistics, unlock progression, locked cards/relics, and optional full card and achievement catalogs. Works from the menu or during a run."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "operation_id": {
+     "description": "ID returned by a still-running action",
+     "type": "string"
+    }
+   },
+   "required": [
+    "operation_id"
+   ]
+  },
+  "name": "get_action_status",
+  "description": "Get the final result of an action that outlasted the request wait. Never replay the action just because its response was pending."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "get_screen_state",
+  "description": "RECOMMENDED: Get current screen state (screen_type, choices, hand, monsters, buttons). Use this instead of get_game_state for routine checks."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "get_available_commands",
+  "description": "Get available tools for current screen with descriptions. Returns screen_type and available_tools list."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "card_ids": {
+     "description": "Card IDs to query (e.g., [\"Strike_R\", \"Defend_R\", \"Bash\"])",
+     "type": "array",
+     "items": {
+      "description": "Card ID",
+      "type": "string"
+     }
+    }
+   },
+   "required": [
+    "card_ids"
+   ]
+  },
+  "name": "get_card_info",
+  "description": "Get detailed card info (description, stats, upgraded version). Use when you need to know what a card does."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "relic_ids": {
+     "description": "Relic IDs to query (e.g., [\"Burning Blood\", \"Vajra\", \"Snecko Eye\"])",
+     "type": "array",
+     "items": {
+      "description": "Relic ID",
+      "type": "string"
+     }
+    }
+   },
+   "required": [
+    "relic_ids"
+   ]
+  },
+  "name": "get_relic_info",
+  "description": "Get detailed relic info (description, tier, flavor text). Use when you need to know what a relic does."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "actions": {
+     "description": "Array of action objects. Each object has 'action' field plus action-specific params. Available actions: play_card(card_index OR card_name OR card_id, target_index?), end_turn, choose(choice_index - 1-indexed position in choices list), proceed, skip, cancel, confirm, select_cards(drop:[cards] OR keep:[cards] - specify cards by index/name/id, auto-confirms), use_potion(potion_slot, target_index?), discard_potion(potion_slot), wait(ms? - default 100ms, max 500ms).",
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "target_index": {
+        "description": "1-indexed monster target",
+        "type": "integer"
+       },
+       "drop": {
+        "description": "Cards by initial hand index, name, or ID",
+        "type": "array"
+       },
+       "card_index": {
+        "description": "1-indexed card position in the initial hand",
+        "type": "integer"
+       },
+       "choice_index": {
+        "description": "1-indexed choice position",
+        "type": "integer"
+       },
+       "ms": {
+        "description": "Wait duration, maximum 500 ms",
+        "type": "integer"
+       },
+       "potion_slot": {
+        "description": "1-indexed potion slot",
+        "type": "integer"
+       },
+       "keep": {
+        "description": "Cards by initial hand index, name, or ID",
+        "type": "array"
+       },
+       "card_name": {
+        "description": "Card name",
+        "type": "string"
+       },
+       "action": {
+        "description": "Action to perform",
+        "type": "string",
+        "enum": [
+         "play_card",
+         "end_turn",
+         "choose",
+         "proceed",
+         "skip",
+         "cancel",
+         "confirm",
+         "select_cards",
+         "use_potion",
+         "discard_potion",
+         "wait"
+        ]
+       },
+       "card_id": {
+        "description": "Card ID",
+        "type": "string"
+       }
+      },
+      "required": [
+       "action"
+      ]
+     }
+    }
+   },
+   "required": [
+    "actions"
+   ]
+  },
+  "name": "execute_actions",
+  "description": "Execute actions in sequence, waiting for each to settle and returning per-action before/after state. Stops when the screen or enemy intent changes so you can reassess. INDICES ARE STABLE - use positions at call time, don't recalculate! Examples: (1) Play cards by name: [{action:'play_card',card_name:'Bash',target_index:1},{action:'play_card',card_name:'Strike',target_index:1}]. (2) Play by index (stable): Hand [1:Strike,2:Defend,3:Bash] -> play 1 and 3: [{action:'play_card',card_index:1,target_index:1},{action:'play_card',card_index:3,target_index:1}]. (3) Collect rewards: [{action:'choose',choice_index:1},{action:'choose',choice_index:2},{action:'proceed'}]. (4) Survivor discard: [{action:'play_card',card_name:'Survivor'},{action:'select_cards',drop:['Strike']}]. (5) Gambler's Chip keep best: [{action:'select_cards',keep:['Bash','Inflame']}]."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "target_index": {
+     "description": "1-indexed monster position (required for targeted cards like Strike)",
+     "type": "integer"
+    },
+    "card_index": {
+     "description": "1-indexed position in hand (mutually exclusive with card_name/card_id)",
+     "type": "integer"
+    },
+    "card_name": {
+     "description": "Card display name, e.g., 'Strike', 'Strike+' (mutually exclusive with card_index/card_id)",
+     "type": "string"
+    },
+    "card_id": {
+     "description": "Card internal ID, e.g., 'Strike_R', 'Defend_G' (mutually exclusive with card_index/card_name)",
+     "type": "string"
+    }
+   }
+  },
+  "name": "play_card",
+  "description": "Play a card from hand. Specify card by ONE of: card_index, card_name, or card_id. Add target_index for attack cards. Examples: {card_name:'Bash',target_index:1}, {card_index:3,target_index:1}, {card_name:'Defend'}. Prefer execute_actions for playing multiple cards."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "end_turn",
+  "description": "End turn. Prefer execute_actions to combine with card plays."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "choice_index": {
+     "description": "1-indexed position in the choices list (required)",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "choice_index"
+   ]
+  },
+  "name": "choose",
+  "description": "Select an option from the current screen's choices list by index. Use get_screen_state to see available choices first. Prefer execute_actions for multiple sequential choices."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "target_index": {
+     "description": "1-indexed monster position (required for targeted potions like Fire Potion)",
+     "type": "integer"
+    },
+    "potion_slot": {
+     "description": "1-indexed potion slot position (required)",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "potion_slot"
+   ]
+  },
+  "name": "use_potion",
+  "description": "Use a potion from your potion slots. Targeted potions (e.g., Fire Potion) require target_index."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "potion_slot": {
+     "description": "1-indexed potion slot position (required)",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "potion_slot"
+   ]
+  },
+  "name": "discard_potion",
+  "description": "Discard a potion to free up a slot for a new potion reward."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "proceed",
+  "description": "Click the proceed/continue button to leave current screen. Available on: COMBAT_REWARD (after collecting), REST (after resting), SHOP_ROOM, CHEST, COMPLETE screens."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "confirm",
+  "description": "Confirm current selection. Available on: GRID (card selection), HAND_SELECT (discard/exhaust selection) screens."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "skip",
+  "description": "Skip without selecting. Available on: CARD_REWARD (skip card pick), BOSS_REWARD (skip boss relic) screens."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "cancel",
+  "description": "Go back or cancel current action. Available on: SHOP_SCREEN (leave shop), MAP (close map), GRID (cancel selection) screens."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "character": {
+     "description": "Character class to play (required)",
+     "type": "string",
+     "enum": [
+      "IRONCLAD",
+      "SILENT",
+      "DEFECT",
+      "WATCHER"
+     ]
+    },
+    "ascension": {
+     "description": "Ascension level 0-20 (optional, default: 0)",
+     "type": "integer"
+    },
+    "seed": {
+     "description": "Alphanumeric seed for reproducible runs (optional)",
+     "type": "string"
+    }
+   },
+   "required": [
+    "character"
+   ]
+  },
+  "name": "start_game",
+  "description": "Start a new run with the specified character. Only available from main menu (not in dungeon)."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "continue_game",
+  "description": "Continue a previously saved run. Only available from main menu when a save file exists."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "abandon_run",
+  "description": "Abandon the current run and delete the save file. Only available from main menu when a save file exists."
+ },
+ {
+  "inputSchema": {
+   "type": "object",
+   "properties": {}
+  },
+  "name": "save_game",
+  "description": "Exit the current run to the main menu. Continue restores the game's latest autosave checkpoint; choices in the current room may need to be repeated."
+ }
+]
